@@ -10,6 +10,7 @@ Key features:
 2. SNP-based read phasing (builtin or WhatsHap)
 3. Independent gap filling per haplotype
 4. Support for ambiguous reads
+5. Full HiFi + ONT utilization (both data types phased independently)
 """
 
 import logging
@@ -45,16 +46,16 @@ class ReadPhaser:
         self.logger = logging.getLogger(__name__)
         self.hap_names = [f"hap{i+1}" for i in range(self.num_haplotypes)]
 
-    def detect_haplotype_snps(self, reads_file: Path, method: str = 'builtin') -> Dict:
+    def detect_haplotype_snps(self, method: str = 'builtin') -> Dict:
         """Detect haplotype-specific SNPs"""
         self.logger.info("Detecting haplotype-specific SNPs...")
 
         if method == 'whatshap':
-            return self._detect_snps_whatshap(reads_file)
+            return self._detect_snps_whatshap()
         else:
-            return self._detect_snps_builtin(reads_file)
+            return self._detect_snps_builtin()
 
-    def _detect_snps_builtin(self, reads_file: Path) -> Dict:
+    def _detect_snps_builtin(self) -> Dict:
         """Built-in SNP detection by comparing haplotype assemblies"""
         snp_db = {}
 
@@ -93,15 +94,16 @@ class ReadPhaser:
 
         return snp_db
 
-    def _detect_snps_whatshap(self, reads_file: Path) -> Dict:
+    def _detect_snps_whatshap(self) -> Dict:
         """Use WhatsHap for SNP detection"""
         self.logger.info("  Using WhatsHap for SNP detection...")
         # Simplified - would need bcftools and whatshap installed
-        return self._detect_snps_builtin(reads_file)
+        return self._detect_snps_builtin()
 
-    def phase_reads(self, bam_file: Path, snp_db: Dict, output_prefix: Path) -> Dict[str, Path]:
+    def phase_reads_from_bam(self, bam_file: Path, snp_db: Dict,
+                             output_prefix: Path, read_type: str = 'reads') -> Dict[str, Path]:
         """Phase reads based on SNP profiles"""
-        self.logger.info("Phasing reads to haplotypes...")
+        self.logger.info(f"Phasing {read_type} reads to haplotypes...")
 
         phased_reads = {hap: [] for hap in self.hap_names}
         ambiguous_reads = []
@@ -137,7 +139,7 @@ class ReadPhaser:
         output_files = {}
 
         for hap_name in self.hap_names:
-            output_file = Path(f"{output_prefix}_{hap_name}_reads.fasta")
+            output_file = Path(f"{output_prefix}_{hap_name}_{read_type}.fasta")
 
             with open(output_file, 'w') as f:
                 for read in phased_reads[hap_name]:
@@ -146,17 +148,18 @@ class ReadPhaser:
                         f.write(f">{read.query_name}\n{seq}\n")
 
             output_files[hap_name] = output_file
-            self.logger.info(f"  {hap_name}: {stats['phased'][hap_name]} reads")
+            self.logger.info(f"  {hap_name}: {stats['phased'][hap_name]} {read_type} reads")
 
         # Write ambiguous reads
-        ambiguous_file = Path(f"{output_prefix}_ambiguous_reads.fasta")
+        ambiguous_file = Path(f"{output_prefix}_ambiguous_{read_type}.fasta")
         with open(ambiguous_file, 'w') as f:
             for read in ambiguous_reads:
                 seq = read.query_sequence
                 if seq:
                     f.write(f">{read.query_name}\n{seq}\n")
 
-        self.logger.info(f"  Ambiguous: {stats['ambiguous']} reads")
+        output_files['ambiguous'] = ambiguous_file
+        self.logger.info(f"  Ambiguous: {stats['ambiguous']} {read_type} reads")
 
         return output_files
 
@@ -206,6 +209,7 @@ class PolyploidEngine:
     Gap filler for polyploid genomes
 
     Coordinates phasing and independent gap filling for each haplotype.
+    Now fully utilizes both HiFi and ONT data when available.
     """
 
     def __init__(self,
@@ -238,6 +242,8 @@ class PolyploidEngine:
         self.logger.info("PolyploidEngine initialized")
         self.logger.info(f"  Ploidy: {self.num_haplotypes}n")
         self.logger.info(f"  Haplotypes: {[h.name for h in self.haplotypes]}")
+        self.logger.info(f"  HiFi reads: {self.hifi_reads}")
+        self.logger.info(f"  ONT reads: {self.ont_reads}")
         self.logger.info(f"  Phasing method: {self.phasing_method}")
         self.logger.info("=" * 60)
 
@@ -250,20 +256,13 @@ class PolyploidEngine:
             raise ValueError("At least one reads file required")
 
     def run(self) -> Dict[str, Path]:
-        """Run polyploid gap filling"""
+        """Run polyploid gap filling with full HiFi + ONT utilization"""
         self.logger.info("Starting polyploid gap filling...")
 
-        # Step 1: Align reads for phasing
-        self.logger.info("STEP 1: Aligning reads for phasing")
-
         ref_hap = self.haplotypes[0]
-        reads_file = self.hifi_reads or self.ont_reads
 
-        aligned_bam = self.output_dir / "reads_aligned.bam"
-        self._align_reads_to_ref(reads_file, ref_hap, aligned_bam)
-
-        # Step 2: Detect haplotype-specific SNPs
-        self.logger.info("STEP 2: Detecting haplotype-specific SNPs")
+        # Step 1: Detect haplotype-specific SNPs (only needs assemblies)
+        self.logger.info("STEP 1: Detecting haplotype-specific SNPs")
 
         phaser = ReadPhaser(
             self.haplotypes,
@@ -271,57 +270,113 @@ class PolyploidEngine:
             work_dir=self.output_dir
         )
 
-        snp_db = phaser.detect_haplotype_snps(reads_file, method=self.phasing_method)
+        snp_db = phaser.detect_haplotype_snps(method=self.phasing_method)
 
         # Save SNP database
         snp_file = self.output_dir / "snp_database.json"
         self._save_snp_db(snp_db, snp_file)
 
-        # Step 3: Phase reads
-        self.logger.info("STEP 3: Phasing reads to haplotypes")
+        # Step 2: Phase HiFi reads (if available)
+        phased_hifi = {}
+        if self.hifi_reads:
+            self.logger.info("STEP 2a: Aligning and phasing HiFi reads")
 
-        phased_reads = phaser.phase_reads(
-            aligned_bam,
-            snp_db,
-            self.output_dir / "phased"
-        )
+            hifi_bam = self.output_dir / "hifi_aligned.bam"
+            self._align_reads_to_ref(self.hifi_reads, ref_hap, hifi_bam, 'map-hifi')
 
-        # Step 4: Run gap filling for each haplotype
-        self.logger.info("STEP 4: Running gap filling for each haplotype")
+            phased_hifi = phaser.phase_reads_from_bam(
+                hifi_bam, snp_db,
+                self.output_dir / "phased",
+                read_type='hifi'
+            )
+
+        # Step 3: Phase ONT reads (if available)
+        phased_ont = {}
+        if self.ont_reads:
+            self.logger.info("STEP 2b: Aligning and phasing ONT reads")
+
+            ont_bam = self.output_dir / "ont_aligned.bam"
+            self._align_reads_to_ref(self.ont_reads, ref_hap, ont_bam, 'map-ont')
+
+            phased_ont = phaser.phase_reads_from_bam(
+                ont_bam, snp_db,
+                self.output_dir / "phased",
+                read_type='ont'
+            )
+
+        # Step 4: Run gap filling for each haplotype with both read types
+        self.logger.info("STEP 3: Running gap filling for each haplotype")
 
         filled_assemblies = {}
 
         for i, (hap_name, hap_file) in enumerate(zip(self.hap_names, self.haplotypes)):
-            self.logger.info(f"\nProcessing {hap_name}: {hap_file.name}")
+            self.logger.info(f"\n{'='*40}")
+            self.logger.info(f"Processing {hap_name}: {hap_file.name}")
+            self.logger.info(f"{'='*40}")
 
-            hap_reads = phased_reads.get(hap_name)
+            # Prepare HiFi reads for this haplotype
+            hap_hifi_reads = None
+            if phased_hifi:
+                hap_hifi = phased_hifi.get(hap_name)
+                if hap_hifi and hap_hifi.exists() and hap_hifi.stat().st_size > 0:
+                    if self.use_ambiguous_reads and 'ambiguous' in phased_hifi:
+                        # Combine phased + ambiguous HiFi reads
+                        combined_hifi = self.output_dir / f"{hap_name}_combined_hifi.fasta"
+                        self._combine_fasta_files(
+                            [hap_hifi, phased_hifi['ambiguous']],
+                            combined_hifi
+                        )
+                        hap_hifi_reads = combined_hifi
+                    else:
+                        hap_hifi_reads = hap_hifi
 
-            if self.use_ambiguous_reads:
-                ambiguous_file = self.output_dir / "phased_ambiguous_reads.fasta"
-                if ambiguous_file.exists():
-                    combined_reads = self.output_dir / f"{hap_name}_combined_reads.fasta"
-                    self._combine_fasta_files([hap_reads, ambiguous_file], combined_reads)
-                    hap_reads = combined_reads
+                    self.logger.info(f"  HiFi reads: {hap_hifi_reads}")
+
+            # Prepare ONT reads for this haplotype
+            hap_ont_reads = None
+            if phased_ont:
+                hap_ont = phased_ont.get(hap_name)
+                if hap_ont and hap_ont.exists() and hap_ont.stat().st_size > 0:
+                    if self.use_ambiguous_reads and 'ambiguous' in phased_ont:
+                        # Combine phased + ambiguous ONT reads
+                        combined_ont = self.output_dir / f"{hap_name}_combined_ont.fasta"
+                        self._combine_fasta_files(
+                            [hap_ont, phased_ont['ambiguous']],
+                            combined_ont
+                        )
+                        hap_ont_reads = combined_ont
+                    else:
+                        hap_ont_reads = hap_ont
+
+                    self.logger.info(f"  ONT reads: {hap_ont_reads}")
+
+            # Check we have at least one read type
+            if not hap_hifi_reads and not hap_ont_reads:
+                self.logger.warning(f"  No phased reads for {hap_name}, skipping")
+                filled_assemblies[hap_name] = hap_file
+                continue
 
             hap_output = self.output_dir / hap_name
 
             filled_assembly = self._run_gap_filling_for_haplotype(
-                hap_file, hap_reads, hap_output
+                hap_file,
+                hap_hifi_reads,
+                hap_ont_reads,
+                hap_output
             )
 
             filled_assemblies[hap_name] = filled_assembly
 
         # Step 5: Generate summary
-        self.logger.info("STEP 5: Generating summary report")
+        self.logger.info("\nSTEP 4: Generating summary report")
         self._generate_summary(filled_assemblies)
 
         return filled_assemblies
 
-    def _align_reads_to_ref(self, reads_file: Path, ref_file: Path, output_bam: Path) -> bool:
+    def _align_reads_to_ref(self, reads_file: Path, ref_file: Path,
+                            output_bam: Path, preset: str) -> bool:
         """Align reads to reference for phasing"""
         try:
-            preset = 'map-hifi' if self.hifi_reads else 'map-ont'
-
             cmd = f"minimap2 -ax {preset} -t {self.threads} --secondary=no " \
                   f"{ref_file} {reads_file} | " \
                   f"samtools sort -@ {self.threads} -o {output_bam} - && " \
@@ -354,21 +409,21 @@ class PolyploidEngine:
                     with open(input_file) as inp:
                         out.write(inp.read())
 
-    def _run_gap_filling_for_haplotype(self, assembly: Path, reads: Path,
+    def _run_gap_filling_for_haplotype(self, assembly: Path,
+                                        hifi_reads: Optional[Path],
+                                        ont_reads: Optional[Path],
                                         output_dir: Path) -> Path:
-        """Run gap filling for a single haplotype"""
-        hifi_reads = None
-        ont_reads = None
+        """Run gap filling for a single haplotype with both read types"""
 
-        if self.hifi_reads:
-            hifi_reads = str(reads)
-        else:
-            ont_reads = str(reads)
+        self.logger.info(f"  Starting HaploidEngine with:")
+        self.logger.info(f"    Assembly: {assembly}")
+        self.logger.info(f"    HiFi: {hifi_reads}")
+        self.logger.info(f"    ONT: {ont_reads}")
 
         engine = HaploidEngine(
             assembly_file=str(assembly),
-            hifi_reads=hifi_reads,
-            ont_reads=ont_reads,
+            hifi_reads=str(hifi_reads) if hifi_reads else None,
+            ont_reads=str(ont_reads) if ont_reads else None,
             output_dir=str(output_dir),
             threads=self.threads,
             max_iterations=self.max_iterations
@@ -382,6 +437,10 @@ class PolyploidEngine:
             'timestamp': datetime.now().isoformat(),
             'num_haplotypes': self.num_haplotypes,
             'phasing_method': self.phasing_method,
+            'data_types': {
+                'hifi': self.hifi_reads is not None,
+                'ont': self.ont_reads is not None
+            },
             'haplotypes': {}
         }
 
@@ -398,7 +457,10 @@ class PolyploidEngine:
         with open(summary_file, 'w') as f:
             json.dump(summary, f, indent=2)
 
-        self.logger.info("\nPOLYPLOID GAP FILLING COMPLETE")
+        self.logger.info("\n" + "=" * 60)
+        self.logger.info("POLYPLOID GAP FILLING COMPLETE")
+        self.logger.info("=" * 60)
+        self.logger.info(f"Data types used: HiFi={self.hifi_reads is not None}, ONT={self.ont_reads is not None}")
         for hap_name, assembly_path in filled_assemblies.items():
             self.logger.info(f"  {hap_name}: {assembly_path}")
 
