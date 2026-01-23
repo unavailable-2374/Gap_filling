@@ -67,6 +67,11 @@ Examples:
         action="store_true",
         help="Exclude ambiguous reads in polyploid mode"
     )
+    parser.add_argument(
+        "--optimized",
+        action="store_true",
+        help="Use optimized batch alignment (reduces alignments by 75%% for polyploid)"
+    )
 
     # Other
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
@@ -117,22 +122,40 @@ Examples:
     else:
         logger.info("=" * 60)
         logger.info(f"GapFill - POLYPLOID MODE ({num_assemblies} haplotypes)")
+        if args.optimized:
+            logger.info("Using OPTIMIZED batch alignment (75% fewer alignments)")
         logger.info("=" * 60)
 
-        from gapfill.engines.polyploid import PolyploidEngine
+        if args.optimized:
+            from gapfill.engines.optimized_polyploid import OptimizedPolyploidEngine
 
-        engine = PolyploidEngine(
-            haplotype_assemblies=args.assembly,
-            hifi_reads=args.hifi_reads,
-            ont_reads=args.ont_reads,
-            hic_reads=args.hic_reads,
-            hic_bam=args.hic_bam,
-            output_dir=args.output,
-            threads=args.threads,
-            max_iterations=args.max_iterations,
-            phasing_method=args.phasing,
-            use_ambiguous_reads=not args.no_ambiguous_reads
-        )
+            engine = OptimizedPolyploidEngine(
+                haplotype_assemblies=args.assembly,
+                hifi_reads=args.hifi_reads,
+                ont_reads=args.ont_reads,
+                hic_reads=args.hic_reads,
+                hic_bam=args.hic_bam,
+                output_dir=args.output,
+                threads=args.threads,
+                max_iterations=args.max_iterations,
+                use_ambiguous_reads=not args.no_ambiguous_reads
+            )
+        else:
+            from gapfill.engines.polyploid import PolyploidEngine
+
+            engine = PolyploidEngine(
+                haplotype_assemblies=args.assembly,
+                hifi_reads=args.hifi_reads,
+                ont_reads=args.ont_reads,
+                hic_reads=args.hic_reads,
+                hic_bam=args.hic_bam,
+                output_dir=args.output,
+                threads=args.threads,
+                max_iterations=args.max_iterations,
+                phasing_method=args.phasing,
+                use_ambiguous_reads=not args.no_ambiguous_reads
+            )
+
         results = engine.run()
 
         logger.info("\nFilled assemblies:")
