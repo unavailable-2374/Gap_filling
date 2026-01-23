@@ -1,216 +1,139 @@
 # Gap Filling Pipeline
 
-An optimized iterative gap filling pipeline for genome assemblies using HiFi and ONT long reads. Supports both haploid and **polyploid** genomes with integrated phasing.
+An optimized iterative gap filling pipeline for genome assemblies using HiFi and ONT long reads. Supports both haploid and polyploid genomes.
 
 ## Features
 
-- **Iterative multi-round gap filling** - Progressive gap closure across multiple iterations
-- **Dual read support** - Works with both PacBio HiFi and Oxford Nanopore reads
-- **Gap normalization** - Standardizes N placeholders to ensure consistent processing
-- **Optimized spanning detection** - Utilizes supplementary alignments to identify gap-crossing reads
-- **Smart merge strategy** - Attempts to merge flanking assemblies to reduce iteration count
-- **wtdbg2-based assembly** - Fast and accurate local assembly for gap regions
-- **Polyploid support** - Handles diploid (2n), tetraploid (4n), hexaploid (6n), and higher ploidy
-- **Integrated phasing** - Built-in SNP-based phasing or WhatsHap integration
+- **Automatic ploidy detection** - Single file = haploid, multiple files = polyploid
+- **Iterative multi-round filling** - Progressive gap closure
+- **HiFi + ONT support** - Works with both read types
+- **Optimized spanning detection** - Uses supplementary alignments
+- **Smart merge strategy** - Reduces iteration count
+- **Integrated phasing** - Built-in or WhatsHap for polyploid
 
 ## Installation
 
-### Dependencies
-
-**Required:**
-- Python 3.8+
-- BioPython
-- pysam
-- minimap2
-- samtools
-- wtdbg2
-
-**Optional:**
-- pyfaidx (10-1000x faster sequence access)
-- seqkit (for hard-clip read extraction)
-
-### Install Python packages
-
 ```bash
+# Python packages
 pip install biopython pysam pyfaidx
+
+# External tools (via conda)
+conda install -c bioconda minimap2 samtools wtdbg
 ```
 
-### Install external tools
+## Quick Start
 
 ```bash
-# Using conda
-conda install -c bioconda minimap2 samtools wtdbg
+# Haploid - single assembly file
+python gapfill.py -a assembly.fa --hifi reads.fq.gz -o output
 
-# Or from source
-# See respective tool documentation
+# Diploid - two haplotype files
+python gapfill.py -a hap1.fa hap2.fa --hifi reads.fq.gz -o output
+
+# Tetraploid - four haplotype files
+python gapfill.py -a hap1.fa hap2.fa hap3.fa hap4.fa --ont reads.fq.gz -o output
 ```
 
 ## Usage
 
-### Basic Usage
+```bash
+python gapfill.py [OPTIONS]
+
+Required:
+  -a, --assembly FILE(s)    Assembly FASTA file(s)
+                            - 1 file  → haploid mode
+                            - 2+ files → polyploid mode
+  --hifi FILE               HiFi reads (at least one of --hifi/--ont required)
+  --ont FILE                ONT reads
+
+Options:
+  -o, --output DIR          Output directory (default: gapfill_output)
+  -t, --threads N           Threads (default: 8)
+  --max-iterations N        Max iterations (default: 10)
+  --min-gap-size N          Min gap size to process (default: 100)
+  --phasing METHOD          Phasing method: builtin|whatshap (default: builtin)
+  --no-ambiguous-reads      Exclude ambiguous reads in polyploid mode
+  -v, --verbose             Verbose output
+```
+
+## Examples
 
 ```bash
-python iterative_gapfiller.py \
-    --assembly input.fasta \
-    --hifi-reads hifi.fastq.gz \
-    --ont-reads ont.fastq.gz \
-    --output output_dir \
-    --threads 8
-```
+# Haploid with both read types
+python gapfill.py -a genome.fa --hifi hifi.fq.gz --ont ont.fq.gz -o filled -t 16
 
-### Full Options
+# Diploid with WhatsHap phasing
+python gapfill.py -a hap1.fa hap2.fa --hifi reads.fq.gz --phasing whatshap -o diploid_out
 
-```bash
-python iterative_gapfiller.py \
-    --assembly input.fasta \
-    --hifi-reads hifi.fastq.gz \
-    --ont-reads ont.fastq.gz \
-    --output output_dir \
-    --threads 8 \
-    --max-iterations 10 \
-    --min-gap-size 100 \
-    --min-mapq 20 \
-    --verbose
-```
-
-### Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--assembly` | Required | Input assembly FASTA file |
-| `--hifi-reads` | Optional | HiFi reads (FASTQ/FASTA, gzipped OK) |
-| `--ont-reads` | Optional | ONT reads (FASTQ/FASTA, gzipped OK) |
-| `--output` | `output` | Output directory |
-| `--threads` | 8 | Number of threads |
-| `--max-iterations` | 10 | Maximum iterations |
-| `--min-gap-size` | 100 | Minimum gap size to process |
-| `--min-mapq` | 20 | Minimum mapping quality |
-| `--verbose` | False | Enable debug logging |
-
-### Polyploid Usage
-
-For polyploid genomes with phased haplotypes:
-
-```bash
-python polyploid_gap_filler.py \
-    --haplotypes hap1.fa hap2.fa hap3.fa hap4.fa \
-    --hifi-reads hifi.fastq.gz \
-    --output polyploid_output \
-    --threads 8
-```
-
-#### Polyploid Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--haplotypes` | Required | Haplotype FASTA files (space-separated) |
-| `--hifi-reads` | Optional | HiFi reads file |
-| `--ont-reads` | Optional | ONT reads file |
-| `--output` | `polyploid_output` | Output directory |
-| `--phasing-method` | `builtin` | `builtin` or `whatshap` |
-| `--no-ambiguous-reads` | False | Exclude ambiguous reads from gap filling |
-
-#### Polyploid Workflow
-
-```
-STEP 1: Align reads to reference haplotype
-           ↓
-STEP 2: Detect haplotype-specific SNPs
-        - builtin: Compare haplotype sequences directly
-        - whatshap: Call variants and use WhatsHap
-           ↓
-STEP 3: Phase reads to haplotypes
-        - Assign each read based on SNP profile
-        - Ambiguous reads used by all haplotypes (optional)
-           ↓
-STEP 4: Independent gap filling per haplotype
-        - Each haplotype uses only its phased reads
-        - Runs standard iterative gap filling
-           ↓
-STEP 5: Output multi-haplotype filled assemblies
+# Hexaploid (6n)
+python gapfill.py -a h1.fa h2.fa h3.fa h4.fa h5.fa h6.fa --hifi reads.fq.gz -o hexaploid_out
 ```
 
 ## How It Works
 
 ### Core Principle
 
-The N sequences in an assembly are **placeholders only** - their length does NOT represent the actual biological gap size.
+N sequences are **placeholders only** - their length does NOT represent actual gap size.
 
-### Workflow
+### Haploid Workflow
 
 ```
-STEP 0: Normalize all gaps to 500N
-           ↓
-STEP 1: Align reads → BAM
-           ↓
-STEP 2: Find gaps (N regions)
-           ↓
-STEP 3: Fill each gap:
-        3.1 Try spanning reads → complete fill
-        3.2 Try flanking reads with merge → complete fill
-        3.3 Flanking with 500N placeholder → partial fill
-           ↓
-STEP 4: Update assembly
-           ↓
-STEP 5: Repeat until no progress
+Normalize gaps (500N) → Align reads → Find gaps → Fill gaps → Repeat
 ```
 
-### Gap Filling Strategies
+### Polyploid Workflow
 
-| Strategy | Description | Result |
-|----------|-------------|--------|
-| **Spanning** | Reads that cross the entire gap (direct or via supplementary alignments) | Complete fill |
-| **Flanking Merged** | Left and right assemblies with detectable overlap | Complete fill |
-| **Flanking** | Left and right assemblies without overlap | Partial fill (500N placeholder) |
+```
+Detect SNPs → Phase reads → Independent filling per haplotype
+```
+
+### Gap Filling Strategy
+
+| Step | Method | Result |
+|------|--------|--------|
+| 1 | Spanning reads (direct + supplementary) | Complete fill |
+| 2 | Flanking reads with merge | Complete fill |
+| 3 | Flanking reads with 500N | Partial fill |
 
 ## Output
 
 ```
-output_dir/
-├── assembly_normalized.fasta   # Gap-normalized assembly
-├── final_assembly.fasta        # Final filled assembly
-├── final_stats.json            # Statistics
-├── validation_results.json     # Remaining unfilled gaps
-├── summary.txt                 # Human-readable summary
-└── iteration_N/                # Per-iteration results
-    ├── assembly_filled.fasta
-    ├── hifi.bam, ont.bam
-    └── work/                   # Per-gap working files
+output/
+├── final_assembly.fasta      # Filled assembly
+├── final_stats.json          # Statistics
+├── validation_results.json   # Remaining gaps
+└── iteration_N/              # Per-iteration files
+```
+
+For polyploid:
+```
+output/
+├── hap1/final_assembly.fasta
+├── hap2/final_assembly.fasta
+├── snp_database.json
+└── polyploid_summary.json
 ```
 
 ## File Structure
 
 ```
 Gap_filling/
-├── iterative_gapfiller.py    # Main entry (haploid)
-├── polyploid_gap_filler.py   # Main entry (polyploid)
-├── gap_filler.py             # Core filling engine
-├── gap_validation.py         # Validation module
-├── assembly_indexer.py       # Fast FASTA access
-├── temp_file_manager.py      # Temp file management
-├── find_gaps.py              # Standalone gap scanner
-├── read_aligner.py           # Standalone aligner
-├── WORKFLOW.md               # Detailed documentation
-└── README.md                 # This file
+├── gapfill.py                # ← UNIFIED ENTRY POINT
+├── iterative_gapfiller.py    # Haploid engine
+├── polyploid_gap_filler.py   # Polyploid engine
+├── gap_filler.py             # Core filling logic
+├── gap_validation.py         # Validation
+├── assembly_indexer.py       # FASTA indexing
+├── temp_file_manager.py      # Temp files
+├── find_gaps.py              # Gap scanner
+├── read_aligner.py           # Aligner wrapper
+└── WORKFLOW.md               # Detailed docs
 ```
 
 ## Documentation
 
-See [WORKFLOW.md](WORKFLOW.md) for detailed documentation including:
-- Complete workflow explanation
-- Key optimizations
-- Class and method descriptions
-- Troubleshooting guide
+See [WORKFLOW.md](WORKFLOW.md) for detailed documentation.
 
 ## License
 
 MIT License
-
-## Citation
-
-If you use this tool in your research, please cite:
-
-```
-Gap Filling Pipeline - An optimized iterative gap filling tool for genome assemblies
-https://github.com/unavailable-2374/Gap_filling
-```
