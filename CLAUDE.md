@@ -4,10 +4,16 @@
 
 ```bash
 # 单倍体
-python -m gapfill -a assembly.fa --hifi reads.fq.gz -o output
+python -m gapfill -a assembly.fa --hifi hifi.fq --ont ont.fq -o output
 
 # 多倍体 (自动检测)
-python -m gapfill -a hap1.fa hap2.fa --hifi reads.fq.gz -o output
+python -m gapfill -a hap1.fa hap2.fa --hifi hifi.fq --ont ont.fq -o output
+
+# 多倍体 + 优化模式 (减少75%比对)
+python -m gapfill -a hap1.fa hap2.fa --hifi hifi.fq --optimized -o output
+
+# 使用 Hi-C 数据
+python -m gapfill -a assembly.fa --hifi hifi.fq --hic hic_R1.fq hic_R2.fq -o output
 ```
 
 ## 核心原则
@@ -16,129 +22,84 @@ python -m gapfill -a hap1.fa hap2.fa --hifi reads.fq.gz -o output
 2. **Gap 标准化** - 所有 N 占位符标准化为 500bp，确保 spanning reads 检测正确
 3. **多轮迭代** - 逐步填充，每轮重新比对 reads
 4. **Supplementary 检测** - 利用 supplementary alignments 发现真正跨 gap 的 reads
+5. **HiFi 优先** - 6层策略优先使用高准确性 HiFi，ONT 提供长度优势
 
 ## 包结构
 
 ```
 gapfill/
-├── __init__.py           # 导出: HaploidEngine, PolyploidEngine, GapFiller, GapValidator
-├── __main__.py           # python -m gapfill 入口
-├── cli.py                # 命令行解析，自动判断单/多倍体模式
+├── __init__.py
+├── __main__.py
+├── cli.py                    # 命令行解析
 ├── core/
-│   ├── filler.py         # GapFiller - 核心填充逻辑 (三步策略)
-│   └── validator.py      # GapValidator - 填充验证
+│   ├── filler.py             # GapFiller - 6层 HiFi/ONT 策略 + Hi-C 辅助
+│   └── validator.py          # GapValidator - 填充验证
 ├── engines/
-│   ├── haploid.py        # HaploidEngine - 单倍体迭代引擎
-│   └── polyploid.py      # PolyploidEngine + ReadPhaser - 多倍体引擎
+│   ├── haploid.py            # HaploidEngine - 单倍体引擎 + Hi-C 整合
+│   ├── polyploid.py          # PolyploidEngine - 多倍体引擎
+│   └── optimized_polyploid.py # OptimizedPolyploidEngine - 批量比对优化
 └── utils/
-    ├── indexer.py        # AssemblyIndexer - pyfaidx 快速序列访问
-    ├── scanner.py        # GapScanner - 扫描 N-runs
-    └── tempfiles.py      # TempFileManager - 临时文件管理
+    ├── indexer.py            # AssemblyIndexer
+    ├── scanner.py            # GapScanner
+    ├── tempfiles.py          # TempFileManager
+    └── hic.py                # HiCAnalyzer - Hi-C 数据分析
 ```
 
-## 核心类详解
+## 核心优化
 
-### GapFiller (core/filler.py)
+### 1. 6层 HiFi/ONT 分层策略 (core/filler.py)
 
-**三步填充策略：**
-
-```python
-def fill_gap(self, gap: Dict) -> Dict:
-    # Step 1: 尝试 spanning reads (直接 + supplementary-linked)
-    result = self._try_spanning_reads_assembly(...)
-    if result['success']: return result  # is_complete=True
-
-    # Step 2: 尝试 flanking reads + 智能合并
-    result = self._try_flanking_reads_with_merge(...)
-    if result['success']: return result  # is_complete=True/False
-
-    # Step 3: 失败
-    return {'success': False, ...}
+```
+TIER 1: HiFi-only spanning     → 最高准确性
+TIER 2: ONT-only spanning      → 长度优势 + 可选 HiFi 抛光
+TIER 3: Hybrid spanning        → 混合跨越reads
+TIER 4: HiFi flanking + merge  → HiFi 侧翼组装 + 智能合并
+TIER 5: ONT flanking + merge   → ONT 侧翼组装 + 可选抛光
+TIER 6: Hybrid flanking + 500N → 最后备选
 ```
 
 **关键方法：**
-- `_get_direct_spanning_reads()` - 直接跨越 gap 的 reads
-- `_get_supplementary_spanning_reads()` - 利用 supplementary 发现跨 gap reads
-- `_try_merge_sequences()` - minimap2 asm5 检测 left/right 重叠并合并
-- `_get_flanking_reads()` - 收集两侧 flanking reads (包含 supplementary)
-- `_run_wtdbg2_assembly()` - wtdbg2 局部组装
+- `_collect_reads_by_type()` - 分别收集 HiFi/ONT reads
+- `_assemble_spanning_reads()` - 类型特定的 wtdbg2 参数
+- `_polish_with_hifi()` - 用 racon 抛光 ONT 组装
+- `_run_wtdbg2_assembly()` - HiFi 用 ccs preset，ONT 用 ont preset
 
-**Supplementary 检测原理：**
-```
-当 read 真正跨越 gap 时，minimap2 产生:
-- Primary alignment: 结束于 gap 左边界
-- Supplementary alignment: 开始于 gap 右边界
-→ 同一个 read_name 出现在 gap 两侧 = 真正的 spanning read
+### 2. Hi-C 数据整合 (utils/hic.py)
 
-代码逻辑:
-left_reads[read.query_name] = {...}   # 结束于 gap_start
-right_reads[read.query_name] = {...}  # 开始于 gap_end
-common = set(left_reads) & set(right_reads)  # 真正跨越的 reads
+| 阶段 | Hi-C 作用 | 方法 |
+|------|----------|------|
+| **填充前** | 估计 gap 真实大小 | `estimate_gap_sizes()` |
+| **填充中** | 指导 wtdbg2 -g 参数 | `gap_size_estimates` |
+| **填充中** | 多候选序列选择 | `_select_best_candidate_with_hic()` |
+| **填充后** | 验证填充正确性 | `validate_fills()` |
+| **Phasing** | 增强 reads 分配 | `enhance_phasing()` |
+
+**HiCAnalyzer 类：**
+- `estimate_gap_sizes()` - Hi-C pairs 跨越 gap 推断真实大小
+- `validate_fills()` - 检查接触图连续性
+- `enhance_phasing()` - 长程信息救回 ambiguous reads
+- `get_contact_matrix()` - 获取区域接触矩阵
+
+### 3. 批量比对优化 (engines/optimized_polyploid.py)
+
+**原理：**
+```
+原始：每个 haplotype 每次迭代独立比对
+  4倍体 × 10迭代 × 2类型 = 80 次比对
+
+优化：合并所有 haplotypes，只比对一次
+  10迭代 × 2类型 = 20 次比对 (减少 75%)
 ```
 
-### HaploidEngine (engines/haploid.py)
-
-**工作流程：**
-```
-STEP 0: _normalize_gaps() → 所有 gap 标准化为 500N
-   ↓
-ITERATION LOOP:
-  Step 1: _align_reads() → minimap2 + samtools
-  Step 2: _find_gaps() → regex 扫描 N+
-  Step 3: GapFiller.fill_gap() → 三步策略
-  Step 4: _apply_fills() → 更新 assembly
-  Step 5: 检查进度，决定是否继续
-   ↓
-OUTPUT: final_assembly.fasta, final_stats.json
-```
+**为什么不稀释覆盖度：**
+- Phased reads 带有 SNP 特征
+- 比对到合并参考时，自然选择正确的 haplotype
+- Primary alignment 落在正确目标上
 
 **关键方法：**
-- `_normalize_gaps()` - 将所有 N 占位符替换为 500N
-- `_align_reads()` - minimap2 比对 (map-hifi/map-ont)
-- `_find_gaps()` - regex 扫描 `N+` (min_gap_size 过滤)
-- `_apply_fills()` - 从后向前应用填充 (避免坐标偏移)
-
-### PolyploidEngine (engines/polyploid.py)
-
-**工作流程：**
-```
-STEP 1: 比对 reads 到参考单倍型
-STEP 2: ReadPhaser.detect_haplotype_snps() → 检测单倍型特异 SNPs
-STEP 3: ReadPhaser.phase_reads() → 根据 SNP 分配 reads 到单倍型
-STEP 4: 对每个单倍型独立运行 HaploidEngine
-STEP 5: 输出多单倍型填充结果
-```
-
-**ReadPhaser 类：**
-- `_detect_snps_builtin()` - 比较单倍型序列找 SNPs
-- `_detect_snps_whatshap()` - 使用 WhatsHap (需要 bcftools)
-- `phase_reads()` - 根据 SNP profile 分配 reads
-- `_assign_read_to_haplotype()` - 计算 hap_scores，选最高分
-
-### GapValidator (core/validator.py)
-
-**验证逻辑：**
-- 检查填充区域的 read 覆盖度
-- 检查 junction 处覆盖度是否连续
-- 对于 partial fill，只验证 left junction (right 连接 N's)
-
-**关键类：**
-- `BAMPool` - BAM 句柄池，避免重复打开
-
-### AssemblyIndexer (utils/indexer.py)
-
-**优化：**
-- pyfaidx 快速序列访问 (10-1000x faster)
-- 全局缓存，跨模块共享 index
-- 自动 fallback 到 BioPython SeqIO
-
-## 填充策略结果
-
-| Strategy | is_complete | has_placeholder | 说明 |
-|----------|-------------|-----------------|------|
-| `spanning` | True | False | 直接或 supplementary 跨越 |
-| `flanking_merged` | True | False | left+right 成功合并 |
-| `flanking` | False | True | left + 500N + right |
+- `_create_merged_reference()` - 合并参考 (hap1__Chr1, hap2__Chr1, ...)
+- `_merge_phased_reads()` - 合并所有 phased reads
+- `_split_bam_by_prefix()` - 按前缀分流 BAM
 
 ## 命令行参数
 
@@ -146,37 +107,67 @@ STEP 5: 输出多单倍型填充结果
 -a, --assembly FILE(s)    # 1个=单倍体，2+个=多倍体
 --hifi FILE               # HiFi reads
 --ont FILE                # ONT reads
+--hic R1 R2               # Hi-C paired-end reads
+--hic-bam FILE            # 预比对的 Hi-C BAM
 -o, --output DIR          # 输出目录
 -t, --threads N           # 线程数 (default: 8)
 --max-iterations N        # 最大迭代 (default: 10)
 --min-gap-size N          # 最小 gap 大小 (default: 100)
 --phasing METHOD          # builtin | whatshap
---no-ambiguous-reads      # 多倍体模式不使用 ambiguous reads
+--no-ambiguous-reads      # 多倍体不使用 ambiguous reads
+--optimized               # 使用批量比对优化 (多倍体)
 -v, --verbose             # 详细日志
 ```
+
+## 填充策略结果
+
+| Strategy | Source | is_complete | has_placeholder | 说明 |
+|----------|--------|-------------|-----------------|------|
+| spanning | hifi_spanning | True | False | HiFi 直接跨越 |
+| spanning | ont_spanning | True | False | ONT 跨越 |
+| spanning | ont_spanning_hifi_polished | True | False | ONT + HiFi 抛光 |
+| spanning | hybrid_ccs/hybrid_ont | True | False | 混合跨越 |
+| flanking_merged | *_flanking_merged | True | False | 侧翼合并成功 |
+| flanking | *_flanking_500N | False | True | 侧翼 + 500N |
 
 ## 输出结构
 
 **单倍体：**
 ```
 output/
-├── assembly_normalized.fasta   # 标准化后的 assembly
-├── final_assembly.fasta        # 最终填充结果
-├── final_stats.json            # 统计信息
+├── assembly_normalized.fasta
+├── final_assembly.fasta
+├── final_stats.json
+├── hic_aligned.bam              # (如果使用 Hi-C)
 └── iteration_N/
     ├── assembly_filled.fasta
     ├── hifi.bam, ont.bam
-    └── work/gap_*/             # 每个 gap 的工作文件
+    └── work/gap_*/
 ```
 
 **多倍体：**
 ```
 output/
-├── snp_database.json           # SNP 数据库
-├── phased_hap1_reads.fasta     # 分型后的 reads
-├── hap1/final_assembly.fasta   # 各单倍型结果
+├── snp_database.json
+├── phased_*_hifi.fasta
+├── phased_*_ont.fasta
+├── hap1/final_assembly.fasta
 ├── hap2/final_assembly.fasta
-└── polyploid_summary.json      # 汇总报告
+└── summary.json
+```
+
+**多倍体 (优化模式)：**
+```
+output/
+├── phase_hifi.bam, phase_ont.bam   # 一次性 phasing
+├── iteration_N/
+│   ├── merged_reference.fasta      # 合并参考
+│   ├── merged_hifi.bam             # 单次比对！
+│   ├── merged_ont.bam
+│   └── hap*/                       # 分流后的各 haplotype
+├── hap1_filled.fasta
+├── hap2_filled.fasta
+└── summary.json
 ```
 
 ## 依赖
@@ -186,5 +177,16 @@ output/
 - pyfaidx (可选，强烈推荐)
 
 **External:**
-- minimap2, samtools, wtdbg2
+- minimap2, samtools, wtdbg2, wtpoa-cns
+- racon (可选，用于 HiFi 抛光)
+- bwa-mem2 (可选，用于 Hi-C 比对)
 - bcftools, whatshap (多倍体 whatshap 模式)
+
+## 比对次数对比 (多倍体)
+
+| 倍性 | 迭代 | 原始 | 优化 | 减少 |
+|------|------|------|------|------|
+| 2n | 10 | 40 | 20 | 50% |
+| 4n | 10 | 80 | 20 | 75% |
+| 6n | 10 | 120 | 20 | 83% |
+| 8n | 10 | 160 | 20 | 87.5% |
