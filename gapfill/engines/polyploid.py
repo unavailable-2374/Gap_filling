@@ -25,6 +25,7 @@ import pysam
 from Bio import SeqIO
 
 from gapfill.engines.haploid import HaploidEngine
+from gapfill.utils.hic import HiCAnalyzer, align_hic_reads
 
 
 class ReadPhaser:
@@ -216,6 +217,8 @@ class PolyploidEngine:
                  haplotype_assemblies: List[str],
                  hifi_reads: Optional[str] = None,
                  ont_reads: Optional[str] = None,
+                 hic_reads: Optional[List[str]] = None,
+                 hic_bam: Optional[str] = None,
                  output_dir: str = "polyploid_output",
                  threads: int = 8,
                  max_iterations: int = 10,
@@ -226,6 +229,8 @@ class PolyploidEngine:
         self.num_haplotypes = len(self.haplotypes)
         self.hifi_reads = Path(hifi_reads) if hifi_reads else None
         self.ont_reads = Path(ont_reads) if ont_reads else None
+        self.hic_reads = hic_reads  # [R1, R2] or None
+        self.hic_bam = Path(hic_bam) if hic_bam else None
         self.output_dir = Path(output_dir)
         self.threads = threads
         self.max_iterations = max_iterations
@@ -236,6 +241,9 @@ class PolyploidEngine:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.hap_names = [f"hap{i+1}" for i in range(self.num_haplotypes)]
 
+        # Hi-C analyzer (initialized when needed)
+        self.hic_analyzer: Optional[HiCAnalyzer] = None
+
         self._validate_inputs()
 
         self.logger.info("=" * 60)
@@ -244,6 +252,8 @@ class PolyploidEngine:
         self.logger.info(f"  Haplotypes: {[h.name for h in self.haplotypes]}")
         self.logger.info(f"  HiFi reads: {self.hifi_reads}")
         self.logger.info(f"  ONT reads: {self.ont_reads}")
+        self.logger.info(f"  Hi-C reads: {self.hic_reads}")
+        self.logger.info(f"  Hi-C BAM: {self.hic_bam}")
         self.logger.info(f"  Phasing method: {self.phasing_method}")
         self.logger.info("=" * 60)
 
@@ -260,6 +270,11 @@ class PolyploidEngine:
         self.logger.info("Starting polyploid gap filling...")
 
         ref_hap = self.haplotypes[0]
+
+        # Step 0: Prepare Hi-C data if available
+        if self.hic_reads or self.hic_bam:
+            self.logger.info("STEP 0: Preparing Hi-C data")
+            self._prepare_hic_data(ref_hap)
 
         # Step 1: Detect haplotype-specific SNPs (only needs assemblies)
         self.logger.info("STEP 1: Detecting haplotype-specific SNPs")
@@ -304,7 +319,33 @@ class PolyploidEngine:
                 read_type='ont'
             )
 
-        # Step 4: Run gap filling for each haplotype with both read types
+        # Step 2c: Enhance phasing with Hi-C (if available)
+        if self.hic_analyzer:
+            self.logger.info("STEP 2c: Enhancing phasing with Hi-C long-range information")
+
+            # Combine phased reads info
+            all_phased = {}
+            if phased_hifi:
+                all_phased.update({k: v for k, v in phased_hifi.items() if k != 'ambiguous'})
+            if phased_ont:
+                for k, v in phased_ont.items():
+                    if k != 'ambiguous' and k not in all_phased:
+                        all_phased[k] = v
+
+            if all_phased:
+                enhanced_assignments = self.hic_analyzer.enhance_phasing(
+                    snp_db, all_phased, self.hap_names
+                )
+
+                # Write enhanced phased reads
+                rescued_counts = {hap: 0 for hap in self.hap_names}
+                for read_name, hap in enhanced_assignments.items():
+                    if hap in rescued_counts:
+                        rescued_counts[hap] += 1
+
+                self.logger.info(f"  Hi-C rescued reads per haplotype: {rescued_counts}")
+
+        # Step 3: Run gap filling for each haplotype with both read types
         self.logger.info("STEP 3: Running gap filling for each haplotype")
 
         filled_assemblies = {}
@@ -372,6 +413,34 @@ class PolyploidEngine:
         self._generate_summary(filled_assemblies)
 
         return filled_assemblies
+
+    def _prepare_hic_data(self, ref_assembly: Path):
+        """Prepare Hi-C BAM file and analyzer"""
+        hic_bam_path = self.hic_bam
+
+        # Align Hi-C reads if BAM not provided
+        if not hic_bam_path and self.hic_reads:
+            hic_bam_path = self.output_dir / "hic_aligned.bam"
+            if not hic_bam_path.exists():
+                self.logger.info("  Aligning Hi-C reads to reference haplotype...")
+                align_hic_reads(
+                    self.hic_reads[0],
+                    self.hic_reads[1],
+                    str(ref_assembly),
+                    str(hic_bam_path),
+                    threads=self.threads
+                )
+
+        # Initialize analyzer
+        if hic_bam_path and hic_bam_path.exists():
+            self.hic_analyzer = HiCAnalyzer(
+                hic_bam=str(hic_bam_path),
+                assembly_file=str(ref_assembly),
+                threads=self.threads
+            )
+            self.logger.info(f"  Hi-C analyzer ready: {hic_bam_path}")
+        else:
+            self.logger.warning("  Hi-C BAM not available")
 
     def _align_reads_to_ref(self, reads_file: Path, ref_file: Path,
                             output_bam: Path, preset: str) -> bool:
