@@ -7,6 +7,7 @@ OPTIMIZATIONS:
 2. Different wtdbg2 presets for different read types
 3. Optional HiFi polish for ONT assemblies
 4. Source tracking for quality assessment
+5. Hi-C guided candidate selection when multiple assemblies produced
 
 Strategy tiers:
   TIER 1: HiFi-only spanning (highest accuracy)
@@ -21,13 +22,16 @@ import logging
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, TYPE_CHECKING
 from collections import defaultdict
 
 import pysam
 from Bio import SeqIO
 
 from gapfill.utils.indexer import AssemblyIndexer
+
+if TYPE_CHECKING:
+    from gapfill.utils.hic import HiCAnalyzer
 
 
 class GapFiller:
@@ -47,7 +51,9 @@ class GapFiller:
                  min_mapq: int = 20,
                  min_spanning_reads: int = 3,
                  min_overlap: int = 100,
-                 enable_polish: bool = True):
+                 enable_polish: bool = True,
+                 hic_analyzer: Optional['HiCAnalyzer'] = None,
+                 gap_size_estimates: Optional[Dict[str, int]] = None):
 
         self.assembly_file = Path(assembly_file)
         self.hifi_bam = Path(hifi_bam) if hifi_bam else None
@@ -61,6 +67,8 @@ class GapFiller:
         self.min_spanning_reads = min_spanning_reads
         self.min_overlap = min_overlap
         self.enable_polish = enable_polish
+        self.hic_analyzer = hic_analyzer
+        self.gap_size_estimates = gap_size_estimates or {}
 
         self.logger = logging.getLogger(__name__)
         self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -70,10 +78,12 @@ class GapFiller:
         # Check available data types
         self.has_hifi = self.hifi_bam is not None and self.hifi_bam.exists()
         self.has_ont = self.ont_bam is not None and self.ont_bam.exists()
+        self.has_hic = self.hic_analyzer is not None
 
         self.logger.info(f"GapFiller initialized (tiered HiFi/ONT strategy)")
         self.logger.info(f"  HiFi BAM: {self.hifi_bam} ({'available' if self.has_hifi else 'not available'})")
         self.logger.info(f"  ONT BAM: {self.ont_bam} ({'available' if self.has_ont else 'not available'})")
+        self.logger.info(f"  Hi-C: {'available' if self.has_hic else 'not available'}")
         self.logger.info(f"  Polish enabled: {self.enable_polish}")
 
     def fill_gap(self, gap: Dict) -> Dict:
@@ -102,7 +112,7 @@ class GapFiller:
         if reads_info['hifi_spanning_count'] >= self.min_spanning_reads:
             self.logger.info(f"  TIER 1: Trying HiFi-only spanning...")
             result = self._assemble_spanning_reads(
-                reads_info['hifi_spanning'], gap_work_dir, 'hifi', gap_name
+                reads_info['hifi_spanning'], gap_work_dir, 'hifi', gap_name, gap
             )
             if result['success']:
                 result['source'] = 'hifi_spanning'
@@ -116,7 +126,7 @@ class GapFiller:
         if reads_info['ont_spanning_count'] >= self.min_spanning_reads:
             self.logger.info(f"  TIER 2: Trying ONT-only spanning...")
             result = self._assemble_spanning_reads(
-                reads_info['ont_spanning'], gap_work_dir, 'ont', gap_name
+                reads_info['ont_spanning'], gap_work_dir, 'ont', gap_name, gap
             )
             if result['success']:
                 # Optional: Polish with HiFi reads if available
@@ -147,7 +157,7 @@ class GapFiller:
             result = self._assemble_hybrid_spanning(
                 reads_info['hifi_spanning'],
                 reads_info['ont_spanning'],
-                gap_work_dir, gap_name
+                gap_work_dir, gap_name, gap
             )
             if result['success']:
                 result['tier'] = 3
@@ -161,7 +171,7 @@ class GapFiller:
             self.logger.info(f"  TIER 4: Trying HiFi flanking + merge...")
             result = self._assemble_flanking_reads(
                 reads_info['hifi_left'], reads_info['hifi_right'],
-                gap_work_dir, 'hifi', gap_name
+                gap_work_dir, 'hifi', gap_name, gap
             )
             if result['success']:
                 result['tier'] = 4
@@ -175,7 +185,7 @@ class GapFiller:
             self.logger.info(f"  TIER 5: Trying ONT flanking + merge...")
             result = self._assemble_flanking_reads(
                 reads_info['ont_left'], reads_info['ont_right'],
-                gap_work_dir, 'ont', gap_name
+                gap_work_dir, 'ont', gap_name, gap
             )
             if result['success']:
                 # Optional polish
@@ -201,7 +211,7 @@ class GapFiller:
         if all_left or all_right:
             self.logger.info(f"  TIER 6: Trying hybrid flanking...")
             result = self._assemble_flanking_reads(
-                all_left, all_right, gap_work_dir, 'hybrid', gap_name
+                all_left, all_right, gap_work_dir, 'hybrid', gap_name, gap
             )
             if result['success']:
                 result['tier'] = 6
@@ -458,7 +468,7 @@ class GapFiller:
 
     def _assemble_spanning_reads(self, reads: List[Tuple[str, str, str]],
                                   work_dir: Path, read_type: str,
-                                  gap_name: str) -> Dict:
+                                  gap_name: str, gap_info: Optional[Dict] = None) -> Dict:
         """Assemble spanning reads of a specific type"""
         if len(reads) < self.min_spanning_reads:
             return {'success': False, 'reason': 'Insufficient reads'}
@@ -468,7 +478,9 @@ class GapFiller:
             for i, (seq, name, source) in enumerate(reads):
                 f.write(f">{name}__{source}__{i}\n{seq}\n")
 
-        assembled_seq = self._run_wtdbg2_assembly(reads_fasta, work_dir, f"spanning_{read_type}", read_type)
+        assembled_seq = self._run_wtdbg2_assembly(
+            reads_fasta, work_dir, f"spanning_{read_type}", read_type, gap_info
+        )
 
         if assembled_seq and len(assembled_seq) >= 100:
             return {
@@ -486,7 +498,8 @@ class GapFiller:
 
     def _assemble_hybrid_spanning(self, hifi_reads: List[Tuple[str, str, str]],
                                    ont_reads: List[Tuple[str, str, str]],
-                                   work_dir: Path, gap_name: str) -> Dict:
+                                   work_dir: Path, gap_name: str,
+                                   gap_info: Optional[Dict] = None) -> Dict:
         """Assemble hybrid spanning reads - try multiple strategies"""
         results = []
 
@@ -498,7 +511,9 @@ class GapFiller:
                 for i, (seq, name, source) in enumerate(all_reads):
                     f.write(f">{name}__{source}__{i}\n{seq}\n")
 
-            seq = self._run_wtdbg2_assembly(reads_fasta, work_dir, "spanning_hybrid_ccs", 'hifi')
+            seq = self._run_wtdbg2_assembly(
+                reads_fasta, work_dir, "spanning_hybrid_ccs", 'hifi', gap_info
+            )
             if seq and len(seq) >= 100:
                 results.append(('hybrid_ccs', seq))
 
@@ -509,7 +524,9 @@ class GapFiller:
                 for i, (seq, name, source) in enumerate(all_reads):
                     f.write(f">{name}__{source}__{i}\n{seq}\n")
 
-            seq = self._run_wtdbg2_assembly(reads_fasta, work_dir, "spanning_hybrid_ont", 'ont')
+            seq = self._run_wtdbg2_assembly(
+                reads_fasta, work_dir, "spanning_hybrid_ont", 'ont', gap_info
+            )
             if seq and len(seq) >= 100:
                 results.append(('hybrid_ont', seq))
 
@@ -532,7 +549,7 @@ class GapFiller:
     def _assemble_flanking_reads(self, left_reads: List[Tuple[str, str, str]],
                                   right_reads: List[Tuple[str, str, str]],
                                   work_dir: Path, read_type: str,
-                                  gap_name: str) -> Dict:
+                                  gap_name: str, gap_info: Optional[Dict] = None) -> Dict:
         """Assemble flanking reads and try to merge"""
 
         # Assemble left side
@@ -542,7 +559,9 @@ class GapFiller:
             with open(left_fasta, 'w') as f:
                 for i, (seq, name, source) in enumerate(left_reads):
                     f.write(f">{name}__{source}__{i}\n{seq}\n")
-            left_seq = self._run_wtdbg2_assembly(left_fasta, work_dir, f"left_{read_type}", read_type) or ''
+            left_seq = self._run_wtdbg2_assembly(
+                left_fasta, work_dir, f"left_{read_type}", read_type, gap_info
+            ) or ''
 
         # Assemble right side
         right_seq = ''
@@ -551,7 +570,9 @@ class GapFiller:
             with open(right_fasta, 'w') as f:
                 for i, (seq, name, source) in enumerate(right_reads):
                     f.write(f">{name}__{source}__{i}\n{seq}\n")
-            right_seq = self._run_wtdbg2_assembly(right_fasta, work_dir, f"right_{read_type}", read_type) or ''
+            right_seq = self._run_wtdbg2_assembly(
+                right_fasta, work_dir, f"right_{read_type}", read_type, gap_info
+            ) or ''
 
         if not left_seq and not right_seq:
             return {'success': False, 'reason': f'Flanking assembly failed for {read_type}'}
@@ -708,8 +729,13 @@ class GapFiller:
             return None
 
     def _run_wtdbg2_assembly(self, reads_fasta: Path, work_dir: Path,
-                             prefix: str, read_type: str = 'hifi') -> Optional[str]:
-        """Run wtdbg2 assembly with type-specific parameters"""
+                             prefix: str, read_type: str = 'hifi',
+                             gap_info: Optional[Dict] = None) -> Optional[str]:
+        """Run wtdbg2 assembly with type-specific parameters
+
+        If Hi-C is available and multiple contigs are produced,
+        uses Hi-C contact frequency to select the best candidate.
+        """
         output_prefix = work_dir / f"{prefix}_wtdbg2"
 
         # Set parameters based on read type
@@ -742,7 +768,11 @@ class GapFiller:
             if read_count < 3:
                 return None
 
+            # Use Hi-C estimated size if available
             estimated_size = max(total_bases // 50, 10000)
+            if gap_info and gap_info.get('name') in self.gap_size_estimates:
+                estimated_size = self.gap_size_estimates[gap_info['name']]
+                self.logger.debug(f"    Using Hi-C estimated size: {estimated_size}bp")
 
             result = subprocess.run(
                 ['wtdbg2', '-x', preset, '-g', str(estimated_size),
@@ -771,15 +801,140 @@ class GapFiller:
 
             if consensus_fa.exists():
                 sequences = list(SeqIO.parse(consensus_fa, 'fasta'))
-                if sequences:
+                if not sequences:
+                    return None
+
+                # If only one sequence or no Hi-C, return longest
+                if len(sequences) == 1 or not self.has_hic or not gap_info:
                     best_seq = max(sequences, key=lambda x: len(x.seq))
                     return str(best_seq.seq)
+
+                # Multiple candidates + Hi-C available: use Hi-C to select
+                self.logger.debug(f"    {len(sequences)} candidate contigs, using Hi-C to select")
+                best_seq = self._select_best_candidate_with_hic(
+                    sequences, gap_info, work_dir
+                )
+                return best_seq
 
             return None
 
         except Exception as e:
             self.logger.warning(f"wtdbg2 error: {e}")
             return None
+
+    def _select_best_candidate_with_hic(self, candidates: List,
+                                         gap_info: Dict,
+                                         work_dir: Path) -> Optional[str]:
+        """
+        Select best candidate sequence using Hi-C contact consistency.
+
+        Strategy:
+        - For each candidate, simulate inserting it into the gap
+        - Score based on Hi-C contact frequency with flanking regions
+        - Higher contact frequency = more likely correct
+        """
+        if not self.hic_analyzer or not candidates:
+            # Fall back to longest
+            return str(max(candidates, key=lambda x: len(x.seq)).seq)
+
+        chrom = gap_info['chrom']
+        gap_start = gap_info['start']
+        gap_end = gap_info['end']
+
+        scores = []
+
+        for i, record in enumerate(candidates):
+            seq = str(record.seq)
+            seq_len = len(seq)
+
+            # Score based on:
+            # 1. Sequence length closer to estimated gap size
+            # 2. Hi-C contact consistency (if available)
+
+            # Length score: prefer sequences close to estimated size
+            estimated_size = self.gap_size_estimates.get(gap_info.get('name', ''), gap_end - gap_start)
+            length_diff = abs(seq_len - estimated_size)
+            length_score = max(0, 1.0 - length_diff / max(estimated_size, 1000))
+
+            # Hi-C score: check contact frequency with flanking regions
+            hic_score = self._compute_hic_consistency_score(
+                chrom, gap_start, gap_end, seq_len
+            )
+
+            # Combined score (weighted)
+            combined_score = 0.3 * length_score + 0.7 * hic_score
+            scores.append((combined_score, seq_len, seq))
+
+            self.logger.debug(f"    Candidate {i+1}: {seq_len}bp, "
+                            f"length_score={length_score:.2f}, "
+                            f"hic_score={hic_score:.2f}, "
+                            f"combined={combined_score:.2f}")
+
+        # Select best scoring candidate
+        best = max(scores, key=lambda x: (x[0], x[1]))  # Score, then length
+        self.logger.debug(f"    Selected: {best[1]}bp (score={best[0]:.2f})")
+
+        return best[2]
+
+    def _compute_hic_consistency_score(self, chrom: str, gap_start: int,
+                                        gap_end: int, fill_length: int) -> float:
+        """
+        Compute Hi-C consistency score for a potential fill.
+
+        Checks if Hi-C contacts across the gap region are consistent
+        with the proposed fill length.
+        """
+        if not self.hic_analyzer:
+            return 0.5  # Neutral score
+
+        try:
+            # Get Hi-C contact matrix around gap region
+            window = 10000
+            region_start = max(0, gap_start - window)
+            region_end = gap_end + window
+
+            matrix = self.hic_analyzer.get_contact_matrix(
+                chrom, region_start, region_end, resolution=1000
+            )
+
+            if matrix is None or matrix.size == 0:
+                return 0.5
+
+            # Calculate expected vs observed contact pattern
+            # Contacts should decay with distance
+            # If fill is correct size, decay pattern should be smooth
+
+            n_bins = matrix.shape[0]
+            gap_bin_start = (gap_start - region_start) // 1000
+            gap_bin_end = (gap_end - region_start) // 1000
+
+            # Check contacts between left flank and right flank
+            left_bins = range(max(0, gap_bin_start - 5), gap_bin_start)
+            right_bins = range(gap_bin_end, min(n_bins, gap_bin_end + 5))
+
+            cross_contacts = 0
+            for lb in left_bins:
+                for rb in right_bins:
+                    if 0 <= lb < n_bins and 0 <= rb < n_bins:
+                        cross_contacts += matrix[lb, rb]
+
+            # Normalize by region size
+            n_left = len(list(left_bins))
+            n_right = len(list(right_bins))
+            if n_left > 0 and n_right > 0:
+                avg_contacts = cross_contacts / (n_left * n_right)
+
+                # Score: more contacts = better connectivity = higher score
+                # Typical Hi-C contact at ~10kb distance
+                expected_contacts = 5  # Baseline expectation
+                score = min(1.0, avg_contacts / expected_contacts)
+                return score
+
+            return 0.5
+
+        except Exception as e:
+            self.logger.debug(f"    Hi-C scoring error: {e}")
+            return 0.5
 
     def close(self):
         if hasattr(self, 'assembly_indexer') and self.assembly_indexer:

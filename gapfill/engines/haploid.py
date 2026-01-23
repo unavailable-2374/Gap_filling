@@ -160,7 +160,9 @@ class HaploidEngine:
                 ont_reads=str(self.ont_reads) if self.ont_reads else None,
                 threads=self.threads,
                 work_dir=str(work_dir),
-                min_mapq=self.min_mapq
+                min_mapq=self.min_mapq,
+                hic_analyzer=self.hic_analyzer,
+                gap_size_estimates=self.gap_size_estimates
             )
 
             fill_results = {}
