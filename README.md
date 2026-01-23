@@ -1,6 +1,6 @@
 # Gap Filling Pipeline
 
-An optimized iterative gap filling pipeline for genome assemblies using HiFi and ONT long reads.
+An optimized iterative gap filling pipeline for genome assemblies using HiFi and ONT long reads. Supports both haploid and **polyploid** genomes with integrated phasing.
 
 ## Features
 
@@ -10,6 +10,8 @@ An optimized iterative gap filling pipeline for genome assemblies using HiFi and
 - **Optimized spanning detection** - Utilizes supplementary alignments to identify gap-crossing reads
 - **Smart merge strategy** - Attempts to merge flanking assemblies to reduce iteration count
 - **wtdbg2-based assembly** - Fast and accurate local assembly for gap regions
+- **Polyploid support** - Handles diploid (2n), tetraploid (4n), hexaploid (6n), and higher ploidy
+- **Integrated phasing** - Built-in SNP-based phasing or WhatsHap integration
 
 ## Installation
 
@@ -85,6 +87,49 @@ python iterative_gapfiller.py \
 | `--min-mapq` | 20 | Minimum mapping quality |
 | `--verbose` | False | Enable debug logging |
 
+### Polyploid Usage
+
+For polyploid genomes with phased haplotypes:
+
+```bash
+python polyploid_gap_filler.py \
+    --haplotypes hap1.fa hap2.fa hap3.fa hap4.fa \
+    --hifi-reads hifi.fastq.gz \
+    --output polyploid_output \
+    --threads 8
+```
+
+#### Polyploid Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--haplotypes` | Required | Haplotype FASTA files (space-separated) |
+| `--hifi-reads` | Optional | HiFi reads file |
+| `--ont-reads` | Optional | ONT reads file |
+| `--output` | `polyploid_output` | Output directory |
+| `--phasing-method` | `builtin` | `builtin` or `whatshap` |
+| `--no-ambiguous-reads` | False | Exclude ambiguous reads from gap filling |
+
+#### Polyploid Workflow
+
+```
+STEP 1: Align reads to reference haplotype
+           ↓
+STEP 2: Detect haplotype-specific SNPs
+        - builtin: Compare haplotype sequences directly
+        - whatshap: Call variants and use WhatsHap
+           ↓
+STEP 3: Phase reads to haplotypes
+        - Assign each read based on SNP profile
+        - Ambiguous reads used by all haplotypes (optional)
+           ↓
+STEP 4: Independent gap filling per haplotype
+        - Each haplotype uses only its phased reads
+        - Runs standard iterative gap filling
+           ↓
+STEP 5: Output multi-haplotype filled assemblies
+```
+
 ## How It Works
 
 ### Core Principle
@@ -137,15 +182,16 @@ output_dir/
 
 ```
 Gap_filling/
-├── iterative_gapfiller.py   # Main entry point
-├── gap_filler.py            # Core filling engine
-├── gap_validation.py        # Validation module
-├── assembly_indexer.py      # Fast FASTA access
-├── temp_file_manager.py     # Temp file management
-├── find_gaps.py             # Standalone gap scanner
-├── read_aligner.py          # Standalone aligner
-├── WORKFLOW.md              # Detailed documentation
-└── README.md                # This file
+├── iterative_gapfiller.py    # Main entry (haploid)
+├── polyploid_gap_filler.py   # Main entry (polyploid)
+├── gap_filler.py             # Core filling engine
+├── gap_validation.py         # Validation module
+├── assembly_indexer.py       # Fast FASTA access
+├── temp_file_manager.py      # Temp file management
+├── find_gaps.py              # Standalone gap scanner
+├── read_aligner.py           # Standalone aligner
+├── WORKFLOW.md               # Detailed documentation
+└── README.md                 # This file
 ```
 
 ## Documentation
