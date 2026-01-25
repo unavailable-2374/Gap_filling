@@ -43,7 +43,8 @@ class HaploidEngine:
                  threads: int = 8,
                  max_iterations: int = 10,
                  min_gap_size: int = 100,
-                 min_mapq: int = 20):
+                 min_mapq: int = 20,
+                 skip_normalization: bool = False):
 
         self.initial_assembly = Path(assembly_file)
         self.hifi_reads = Path(hifi_reads) if hifi_reads else None
@@ -55,6 +56,7 @@ class HaploidEngine:
         self.max_iterations = max_iterations
         self.min_gap_size = min_gap_size
         self.min_mapq = min_mapq
+        self.skip_normalization = skip_normalization
 
         self.logger = logging.getLogger(__name__)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -109,10 +111,17 @@ class HaploidEngine:
                         self.logger.info(f"  {est.gap_name}: estimated {est.estimated_size}bp "
                                         f"(was {est.original_size}bp, {est.confidence})")
 
-        # Step 0c: Normalize gaps
-        if initial_gaps:
+        # Step 0c: Normalize gaps (skip if already normalized by PolyploidEngine)
+        if initial_gaps and not self.skip_normalization:
             self.logger.info("STEP 0c: Gap Normalization")
             current_assembly = self._normalize_gaps(current_assembly, initial_gaps)
+        elif self.skip_normalization:
+            self.logger.info("STEP 0c: Skipping gap normalization (already normalized)")
+            # Copy the assembly to output dir for consistency
+            import shutil
+            normalized_file = self.output_dir / "assembly_normalized.fasta"
+            shutil.copy(current_assembly, normalized_file)
+            current_assembly = normalized_file
 
         completely_filled_gaps = set()
         partially_filled_gaps = set()

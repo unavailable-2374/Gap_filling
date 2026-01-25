@@ -15,6 +15,11 @@ Why this works:
 - Phased reads have SNP signatures of their assigned haplotype
 - They align best to their correct haplotype in merged reference
 - Coverage is NOT diluted because reads self-select correct target
+
+Updates:
+- Now uses alignment-based SNP detection from ReadPhaser
+- Normalizes gaps before SNP detection
+- Supports haplotype-specific gaps
 """
 
 import logging
@@ -34,135 +39,8 @@ from Bio.SeqRecord import SeqRecord
 
 from gapfill.core.filler import GapFiller
 from gapfill.utils.hic import HiCAnalyzer, align_hic_reads
-
-
-class ReadPhaser:
-    """Phase reads to haplotypes based on SNPs (unchanged from polyploid.py)"""
-
-    def __init__(self, haplotype_assemblies: List[Path],
-                 threads: int = 8,
-                 min_read_snps: int = 2,
-                 work_dir: Optional[Path] = None):
-
-        self.haplotypes = haplotype_assemblies
-        self.num_haplotypes = len(haplotype_assemblies)
-        self.threads = threads
-        self.min_read_snps = min_read_snps
-        self.work_dir = work_dir or Path('.')
-
-        self.logger = logging.getLogger(__name__)
-        self.hap_names = [f"hap{i+1}" for i in range(self.num_haplotypes)]
-
-    def detect_haplotype_snps(self) -> Dict:
-        """Detect SNPs by comparing haplotype assemblies"""
-        self.logger.info("Detecting haplotype-specific SNPs...")
-        snp_db = {}
-
-        hap_seqs = {}
-        for i, hap_file in enumerate(self.haplotypes):
-            hap_name = self.hap_names[i]
-            hap_seqs[hap_name] = {}
-            for record in SeqIO.parse(hap_file, 'fasta'):
-                hap_seqs[hap_name][record.id] = str(record.seq).upper()
-
-        ref_hap = self.hap_names[0]
-
-        for chrom in hap_seqs[ref_hap]:
-            snp_db[chrom] = {}
-            ref_seq = hap_seqs[ref_hap][chrom]
-
-            for other_hap in self.hap_names[1:]:
-                if chrom not in hap_seqs[other_hap]:
-                    continue
-
-                other_seq = hap_seqs[other_hap][chrom]
-                min_len = min(len(ref_seq), len(other_seq))
-
-                for pos in range(min_len):
-                    ref_base = ref_seq[pos]
-                    other_base = other_seq[pos]
-
-                    if ref_base != other_base and ref_base != 'N' and other_base != 'N':
-                        if pos not in snp_db[chrom]:
-                            snp_db[chrom][pos] = {ref_hap: ref_base}
-                        snp_db[chrom][pos][other_hap] = other_base
-
-        total_snps = sum(len(positions) for positions in snp_db.values())
-        self.logger.info(f"  Found {total_snps} haplotype-specific SNP positions")
-
-        return snp_db
-
-    def phase_reads_from_bam(self, bam_file: Path, snp_db: Dict,
-                             output_prefix: Path, read_type: str) -> Dict[str, Path]:
-        """Phase reads based on SNP profiles"""
-        self.logger.info(f"Phasing {read_type} reads...")
-
-        phased_reads = {hap: [] for hap in self.hap_names}
-        ambiguous_reads = []
-
-        with pysam.AlignmentFile(str(bam_file), 'rb') as bam:
-            for read in bam:
-                if read.is_unmapped or read.is_secondary:
-                    continue
-
-                hap = self._assign_read(read, snp_db)
-                if hap:
-                    phased_reads[hap].append(read)
-                else:
-                    ambiguous_reads.append(read)
-
-        output_files = {}
-        for hap_name in self.hap_names:
-            output_file = Path(f"{output_prefix}_{hap_name}_{read_type}.fasta")
-            with open(output_file, 'w') as f:
-                for read in phased_reads[hap_name]:
-                    if read.query_sequence:
-                        f.write(f">{read.query_name}\n{read.query_sequence}\n")
-            output_files[hap_name] = output_file
-            self.logger.info(f"  {hap_name}: {len(phased_reads[hap_name])} reads")
-
-        # Ambiguous
-        ambiguous_file = Path(f"{output_prefix}_ambiguous_{read_type}.fasta")
-        with open(ambiguous_file, 'w') as f:
-            for read in ambiguous_reads:
-                if read.query_sequence:
-                    f.write(f">{read.query_name}\n{read.query_sequence}\n")
-        output_files['ambiguous'] = ambiguous_file
-        self.logger.info(f"  Ambiguous: {len(ambiguous_reads)} reads")
-
-        return output_files
-
-    def _assign_read(self, read, snp_db) -> Optional[str]:
-        """Assign read to haplotype based on SNPs"""
-        chrom = read.reference_name
-        if chrom not in snp_db:
-            return None
-
-        hap_scores = {hap: 0 for hap in self.hap_names}
-        snps_checked = 0
-
-        try:
-            for query_pos, ref_pos in read.get_aligned_pairs():
-                if ref_pos is None or query_pos is None:
-                    continue
-                if ref_pos in snp_db[chrom]:
-                    snps_checked += 1
-                    read_base = read.query_sequence[query_pos].upper()
-                    for hap, base in snp_db[chrom][ref_pos].items():
-                        if read_base == base:
-                            hap_scores[hap] += 1
-        except:
-            return None
-
-        if snps_checked < self.min_read_snps:
-            return None
-
-        max_score = max(hap_scores.values())
-        if max_score == 0:
-            return None
-
-        best = [h for h, s in hap_scores.items() if s == max_score]
-        return best[0] if len(best) == 1 else None
+# Import ReadPhaser from polyploid module (with alignment-based SNP detection)
+from gapfill.engines.polyploid import ReadPhaser
 
 
 class OptimizedPolyploidEngine:
@@ -170,6 +48,12 @@ class OptimizedPolyploidEngine:
     Optimized polyploid gap filler with batch alignment.
 
     Key optimization: Merge all haplotypes and align once per iteration.
+
+    Workflow:
+    1. Normalize gaps in ALL haplotypes FIRST
+    2. Detect SNPs using alignment (handles different gap positions)
+    3. Phase reads once
+    4. Iterate: merge references → batch align → split by haplotype → fill gaps
     """
 
     def __init__(self,
@@ -202,6 +86,9 @@ class OptimizedPolyploidEngine:
 
         self.hic_analyzer: Optional[HiCAnalyzer] = None
 
+        # Store normalized assemblies
+        self.normalized_assemblies: Dict[str, Path] = {}
+
         self._validate_inputs()
 
         self.logger.info("=" * 60)
@@ -224,33 +111,53 @@ class OptimizedPolyploidEngine:
         self.logger.info("Starting optimized polyploid gap filling...")
 
         # =====================================================================
-        # PHASE 1: One-time setup (phasing)
+        # PHASE 1: One-time setup (normalization + phasing)
         # =====================================================================
         self.logger.info("\n" + "=" * 60)
         self.logger.info("PHASE 1: Initial Setup (one-time)")
         self.logger.info("=" * 60)
 
-        # Detect SNPs
+        # Initialize phaser
         phaser = ReadPhaser(self.haplotypes, self.threads, work_dir=self.output_dir)
+
+        # STEP 0: Normalize gaps in ALL haplotypes FIRST
+        self.logger.info("STEP 0: Normalizing gaps in all haplotypes")
+        self.normalized_assemblies = phaser.normalize_all_assemblies(
+            min_gap_size=self.min_gap_size
+        )
+
+        # Report haplotype-specific gaps
+        for hap_name, specific_gaps in phaser.haplotype_specific_gaps.items():
+            if specific_gaps:
+                self.logger.info(f"  {hap_name} has {len(specific_gaps)} haplotype-specific gaps")
+
+        # Use first normalized haplotype as reference for read alignment
+        ref_hap = self.hap_names[0]
+        ref_assembly = self.normalized_assemblies[ref_hap]
+
+        # Detect SNPs using alignment-based method
+        self.logger.info("STEP 1: Detecting haplotype-specific SNPs (alignment-based)")
         snp_db = phaser.detect_haplotype_snps()
 
-        # Phase reads (one-time, using hap1 as reference)
-        ref_hap = self.haplotypes[0]
+        # Save SNP database
+        snp_file = self.output_dir / "snp_database.json"
+        self._save_snp_db(snp_db, snp_file)
 
+        # Phase reads (one-time, using normalized hap1 as reference)
         phased_hifi = {}
         if self.hifi_reads:
-            self.logger.info("Phasing HiFi reads...")
+            self.logger.info("STEP 2a: Phasing HiFi reads...")
             hifi_bam = self.output_dir / "phase_hifi.bam"
-            self._align_reads(self.hifi_reads, ref_hap, hifi_bam, 'map-hifi')
+            self._align_reads(self.hifi_reads, ref_assembly, hifi_bam, 'map-hifi')
             phased_hifi = phaser.phase_reads_from_bam(
                 hifi_bam, snp_db, self.output_dir / "phased", 'hifi'
             )
 
         phased_ont = {}
         if self.ont_reads:
-            self.logger.info("Phasing ONT reads...")
+            self.logger.info("STEP 2b: Phasing ONT reads...")
             ont_bam = self.output_dir / "phase_ont.bam"
-            self._align_reads(self.ont_reads, ref_hap, ont_bam, 'map-ont')
+            self._align_reads(self.ont_reads, ref_assembly, ont_bam, 'map-ont')
             phased_ont = phaser.phase_reads_from_bam(
                 ont_bam, snp_db, self.output_dir / "phased", 'ont'
             )
@@ -265,10 +172,10 @@ class OptimizedPolyploidEngine:
         self.logger.info("PHASE 2: Iterative Gap Filling (batch alignment)")
         self.logger.info("=" * 60)
 
-        # Current assemblies for each haplotype
+        # Current assemblies for each haplotype (start with normalized)
         current_assemblies = {
-            hap: self.haplotypes[i]
-            for i, hap in enumerate(self.hap_names)
+            hap: self.normalized_assemblies[hap]
+            for hap in self.hap_names
         }
 
         # Track filled gaps
@@ -389,9 +296,18 @@ class OptimizedPolyploidEngine:
             final_assemblies[hap_name] = final_path
             self.logger.info(f"  {hap_name}: {final_path}")
 
-        self._save_summary(final_assemblies, filled_gaps, failed_gaps)
+        self._save_summary(final_assemblies, filled_gaps, failed_gaps, phaser)
 
         return final_assemblies
+
+    def _save_snp_db(self, snp_db: Dict, output_file: Path):
+        """Save SNP database to JSON"""
+        serializable = {}
+        for chrom, positions in snp_db.items():
+            serializable[chrom] = {str(pos): bases for pos, bases in positions.items()}
+
+        with open(output_file, 'w') as f:
+            json.dump(serializable, f, indent=2)
 
     def _create_merged_reference(self, assemblies: Dict[str, Path],
                                   output_dir: Path) -> Path:
@@ -583,12 +499,19 @@ class OptimizedPolyploidEngine:
 
         return output
 
-    def _save_summary(self, assemblies: Dict, filled: Dict, failed: Dict):
+    def _save_summary(self, assemblies: Dict, filled: Dict, failed: Dict, phaser: ReadPhaser):
         """Save summary statistics"""
         summary = {
             'timestamp': datetime.now().isoformat(),
             'num_haplotypes': self.num_haplotypes,
             'optimization': 'batch_alignment',
+            'gap_info': {
+                hap_name: {
+                    'total_gaps': len(phaser.gap_regions.get(hap_name, [])),
+                    'haplotype_specific_gaps': len(phaser.haplotype_specific_gaps.get(hap_name, set()))
+                }
+                for hap_name in self.hap_names
+            },
             'haplotypes': {}
         }
 

@@ -23,6 +23,8 @@ python -m gapfill -a assembly.fa --hifi hifi.fq --hic hic_R1.fq hic_R2.fq -o out
 3. **多轮迭代** - 逐步填充，每轮重新比对 reads
 4. **Supplementary 检测** - 利用 supplementary alignments 发现真正跨 gap 的 reads
 5. **HiFi 优先** - 6层策略优先使用高准确性 HiFi，ONT 提供长度优势
+6. **多倍体先标准化** - 在 SNP 检测之前先标准化所有 haplotype 的 gap
+7. **Alignment-based SNP 检测** - 使用 minimap2 比对检测 SNP，正确处理 haplotype 独有的 gap
 
 ## 包结构
 
@@ -80,7 +82,35 @@ TIER 6: Hybrid flanking + 500N → 最后备选
 - `enhance_phasing()` - 长程信息救回 ambiguous reads
 - `get_contact_matrix()` - 获取区域接触矩阵
 
-### 3. 批量比对优化 (engines/optimized_polyploid.py)
+### 3. 多倍体 SNP 检测优化 (engines/polyploid.py)
+
+**新流程（解决 gap N 长度不一致问题）：**
+```
+原始流程（有bug）：
+  1. SNP 检测 (逐位置比较，gap长度不同导致坐标偏移)
+  2. Gap 标准化
+  3. Phasing
+  4. Gap filling
+
+新流程（已修复）：
+  STEP 0: Gap 标准化 ALL haplotypes (统一为 500N)
+  STEP 1: Alignment-based SNP 检测 (minimap2 asm5)
+  STEP 2: Phasing reads
+  STEP 3: Gap filling (skip_normalization=True)
+```
+
+**Alignment-based SNP 检测：**
+- 使用 `minimap2 -ax asm5` 比对 hap2→hap1, hap3→hap1, ...
+- 从 CIGAR 字符串中提取 SNP（跳过 gap 区域）
+- 正确处理 haplotype 独有的 gap
+
+**关键类和方法：**
+- `ReadPhaser.normalize_all_assemblies()` - 标准化所有 haplotype
+- `ReadPhaser._detect_snps_alignment()` - alignment-based SNP 检测
+- `ReadPhaser._identify_haplotype_specific_gaps()` - 识别单倍型独有的 gap
+- `GapRegion` dataclass - gap 元数据
+
+### 4. 批量比对优化 (engines/optimized_polyploid.py)
 
 **原理：**
 ```
@@ -119,6 +149,24 @@ TIER 6: Hybrid flanking + 500N → 最后备选
 -v, --verbose             # 详细日志
 ```
 
+## HaploidEngine 参数
+
+```python
+HaploidEngine(
+    assembly_file: str,
+    hifi_reads: str = None,
+    ont_reads: str = None,
+    hic_reads: List[str] = None,
+    hic_bam: str = None,
+    output_dir: str = "output",
+    threads: int = 8,
+    max_iterations: int = 10,
+    min_gap_size: int = 100,
+    min_mapq: int = 20,
+    skip_normalization: bool = False  # 跳过 gap 标准化（多倍体已预处理）
+)
+```
+
 ## 填充策略结果
 
 | Strategy | Source | is_complete | has_placeholder | 说明 |
@@ -148,12 +196,17 @@ output/
 **多倍体：**
 ```
 output/
-├── snp_database.json
+├── hap1_normalized.fasta        # 标准化后的 haplotype assemblies
+├── hap2_normalized.fasta
+├── snp_database.json            # Alignment-based SNP 数据库
 ├── phased_*_hifi.fasta
 ├── phased_*_ont.fasta
-├── hap1/final_assembly.fasta
-├── hap2/final_assembly.fasta
-└── summary.json
+├── hap1/
+│   ├── assembly_normalized.fasta  # 符号链接
+│   └── final_assembly.fasta
+├── hap2/
+│   └── final_assembly.fasta
+└── polyploid_summary.json
 ```
 
 **多倍体 (优化模式)：**
