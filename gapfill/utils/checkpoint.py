@@ -86,6 +86,53 @@ class CheckpointManager:
         """Check if a checkpoint exists"""
         return self.checkpoint_file.exists()
 
+    def scan_existing_files(self) -> CheckpointState:
+        """
+        Scan output directory for existing intermediate files.
+        Use this when checkpoint.json doesn't exist but files from a previous run do.
+        Returns a reconstructed checkpoint state.
+        """
+        self.logger.info("Scanning for existing intermediate files...")
+        state = CheckpointState(engine="unknown", phase="init")
+
+        # Check for normalized assembly
+        normalized = self.output_dir / "assembly_normalized.fasta"
+        if normalized.exists() and normalized.stat().st_size > 0:
+            state.intermediate_files['normalized_assembly'] = str(normalized)
+            state.phase = "normalization"
+            self.logger.info(f"  Found: {normalized}")
+
+        # Check for iteration directories and find the latest
+        latest_iteration = 0
+        latest_assembly = None
+
+        for iter_dir in sorted(self.output_dir.glob("iteration_*")):
+            try:
+                iter_num = int(iter_dir.name.split("_")[1])
+                if iter_num > latest_iteration:
+                    # Check if this iteration has valid output
+                    filled_asm = iter_dir / "assembly_filled.fasta"
+                    if filled_asm.exists() and filled_asm.stat().st_size > 0:
+                        latest_iteration = iter_num
+                        latest_assembly = filled_asm
+            except (ValueError, IndexError):
+                continue
+
+        if latest_iteration > 0:
+            state.iteration = latest_iteration
+            state.phase = "filling"
+            if latest_assembly:
+                state.current_assembly = str(latest_assembly)
+            self.logger.info(f"  Found iterations up to: {latest_iteration}")
+
+        # Check for final assembly (means previous run completed)
+        final_asm = self.output_dir / "final_assembly.fasta"
+        if final_asm.exists() and final_asm.stat().st_size > 0:
+            state.phase = "complete"
+            self.logger.info(f"  Found: {final_asm} (previous run completed)")
+
+        return state
+
     def load(self) -> Optional[CheckpointState]:
         """Load checkpoint from file"""
         if not self.exists():
@@ -255,6 +302,78 @@ class PolyploidCheckpointManager(CheckpointManager):
     def __init__(self, output_dir: str, hap_names: List[str]):
         super().__init__(output_dir)
         self.hap_names = hap_names
+
+    def scan_existing_files(self) -> CheckpointState:
+        """
+        Scan output directory for existing intermediate files (polyploid version).
+        """
+        self.logger.info("Scanning for existing intermediate files (polyploid)...")
+        state = CheckpointState(engine="polyploid", phase="init")
+
+        # Check for normalized assemblies
+        all_normalized = True
+        for hap_name in self.hap_names:
+            normalized = self.output_dir / f"{hap_name}_normalized.fasta"
+            if normalized.exists() and normalized.stat().st_size > 0:
+                state.intermediate_files[f'{hap_name}_normalized'] = str(normalized)
+                self.logger.info(f"  Found: {normalized}")
+            else:
+                all_normalized = False
+
+        if all_normalized:
+            state.phase = "normalization"
+
+        # Check for SNP database
+        snp_db = self.output_dir / "snp_database.json"
+        if snp_db.exists() and snp_db.stat().st_size > 0:
+            state.snp_database_path = str(snp_db)
+            state.phase = "phasing"
+            self.logger.info(f"  Found: {snp_db}")
+
+        # Check for phased reads
+        phased_dir = self.output_dir / "phased"
+        if phased_dir.exists():
+            for hap_name in self.hap_names:
+                for read_type in ['hifi', 'ont']:
+                    phased_file = self.output_dir / f"phased_{hap_name}_{read_type}.fasta"
+                    if phased_file.exists() and phased_file.stat().st_size > 0:
+                        state.phased_reads[f"{hap_name}_{read_type}"] = str(phased_file)
+                        self.logger.info(f"  Found: {phased_file}")
+
+        if state.phased_reads:
+            state.phase = "filling"
+
+        # Check for iteration directories
+        latest_iteration = 0
+        for iter_dir in sorted(self.output_dir.glob("iteration_*")):
+            try:
+                iter_num = int(iter_dir.name.split("_")[1])
+                if iter_num > latest_iteration:
+                    latest_iteration = iter_num
+            except (ValueError, IndexError):
+                continue
+
+        if latest_iteration > 0:
+            state.iteration = latest_iteration
+            state.phase = "filling"
+            self.logger.info(f"  Found iterations up to: {latest_iteration}")
+
+        # Check for final filled assemblies
+        final_count = 0
+        for hap_name in self.hap_names:
+            # Check various possible final assembly names
+            for pattern in [f"{hap_name}_filled.fasta", f"{hap_name}/final_assembly.fasta"]:
+                final_asm = self.output_dir / pattern
+                if final_asm.exists() and final_asm.stat().st_size > 0:
+                    final_count += 1
+                    self.logger.info(f"  Found: {final_asm}")
+                    break
+
+        if final_count == len(self.hap_names):
+            state.phase = "complete"
+            self.logger.info("  Previous run completed")
+
+        return state
 
     def init_haplotype_states(self):
         """Initialize per-haplotype states"""

@@ -122,13 +122,28 @@ class OptimizedPolyploidEngine:
 
         # Check for existing checkpoint
         checkpoint_state = None
-        if self.resume and self.checkpoint.exists():
-            checkpoint_state = self.checkpoint.load()
-            if checkpoint_state:
+        if self.resume:
+            if self.checkpoint.exists():
+                checkpoint_state = self.checkpoint.load()
+                if checkpoint_state:
+                    self.logger.info("=" * 60)
+                    self.logger.info("RESUMING FROM CHECKPOINT")
+                    self.logger.info(f"  Phase: {checkpoint_state.phase}")
+                    self.logger.info(f"  Iteration: {checkpoint_state.iteration}")
+                    self.logger.info("=" * 60)
+            else:
+                # No checkpoint.json but --resume specified
+                # Scan for existing files from previous run
                 self.logger.info("=" * 60)
-                self.logger.info("RESUMING FROM CHECKPOINT")
-                self.logger.info(f"  Phase: {checkpoint_state.phase}")
-                self.logger.info(f"  Iteration: {checkpoint_state.iteration}")
+                self.logger.info("No checkpoint.json found, scanning existing files...")
+                checkpoint_state = self.checkpoint.scan_existing_files()
+                if checkpoint_state.phase != "init":
+                    self.logger.info(f"  Detected phase: {checkpoint_state.phase}")
+                    self.logger.info(f"  Detected iteration: {checkpoint_state.iteration}")
+                    self.checkpoint.save(checkpoint_state)
+                else:
+                    self.logger.info("  No usable files found, starting fresh")
+                    checkpoint_state = None
                 self.logger.info("=" * 60)
 
         # Initialize checkpoint state if not resuming
