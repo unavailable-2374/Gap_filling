@@ -73,6 +73,18 @@ Examples:
         help="Use optimized batch alignment (reduces alignments by 75%% for polyploid)"
     )
 
+    # Resume
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from checkpoint if available"
+    )
+    parser.add_argument(
+        "--clear-checkpoint",
+        action="store_true",
+        help="Clear existing checkpoint and start fresh"
+    )
+
     # Other
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--version", action="version", version="%(prog)s 1.0.0")
@@ -114,7 +126,9 @@ Examples:
             threads=args.threads,
             max_iterations=args.max_iterations,
             min_gap_size=args.min_gap_size,
-            min_mapq=args.min_mapq
+            min_mapq=args.min_mapq,
+            resume=args.resume,
+            clear_checkpoint=args.clear_checkpoint
         )
         result = engine.run()
         logger.info(f"\nOutput: {result}")
@@ -138,7 +152,9 @@ Examples:
                 output_dir=args.output,
                 threads=args.threads,
                 max_iterations=args.max_iterations,
-                use_ambiguous_reads=not args.no_ambiguous_reads
+                use_ambiguous_reads=not args.no_ambiguous_reads,
+                resume=args.resume,
+                clear_checkpoint=args.clear_checkpoint
             )
         else:
             from gapfill.engines.polyploid import PolyploidEngine
@@ -153,7 +169,9 @@ Examples:
                 threads=args.threads,
                 max_iterations=args.max_iterations,
                 phasing_method=args.phasing,
-                use_ambiguous_reads=not args.no_ambiguous_reads
+                use_ambiguous_reads=not args.no_ambiguous_reads,
+                resume=args.resume,
+                clear_checkpoint=args.clear_checkpoint
             )
 
         results = engine.run()

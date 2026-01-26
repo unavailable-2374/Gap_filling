@@ -26,6 +26,7 @@ from Bio.Seq import Seq
 from gapfill.core.filler import GapFiller
 from gapfill.core.validator import GapValidator
 from gapfill.utils.hic import HiCAnalyzer, align_hic_reads
+from gapfill.utils.checkpoint import CheckpointManager, CheckpointState
 
 
 class HaploidEngine:
@@ -44,7 +45,9 @@ class HaploidEngine:
                  max_iterations: int = 10,
                  min_gap_size: int = 100,
                  min_mapq: int = 20,
-                 skip_normalization: bool = False):
+                 skip_normalization: bool = False,
+                 resume: bool = False,
+                 clear_checkpoint: bool = False):
 
         self.initial_assembly = Path(assembly_file)
         self.hifi_reads = Path(hifi_reads) if hifi_reads else None
@@ -57,9 +60,15 @@ class HaploidEngine:
         self.min_gap_size = min_gap_size
         self.min_mapq = min_mapq
         self.skip_normalization = skip_normalization
+        self.resume = resume
 
         self.logger = logging.getLogger(__name__)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Checkpoint manager
+        self.checkpoint = CheckpointManager(str(self.output_dir))
+        if clear_checkpoint:
+            self.checkpoint.clear()
 
         # Hi-C analyzer (initialized when needed)
         self.hic_analyzer: Optional[HiCAnalyzer] = None
@@ -84,12 +93,34 @@ class HaploidEngine:
         self.logger.info(f"  Hi-C reads: {self.hic_reads}")
         self.logger.info(f"  Hi-C BAM: {self.hic_bam}")
         self.logger.info(f"  Output dir: {self.output_dir}")
+        self.logger.info(f"  Resume: {self.resume}")
         self.logger.info("=" * 60)
 
     def run(self) -> Path:
-        """Run iterative gap filling"""
+        """Run iterative gap filling with checkpoint support"""
         current_assembly = self.initial_assembly
-        iteration = 0
+        start_iteration = 0
+
+        # Check for existing checkpoint
+        checkpoint_state = None
+        if self.resume and self.checkpoint.exists():
+            checkpoint_state = self.checkpoint.load()
+            if checkpoint_state:
+                self.logger.info("=" * 60)
+                self.logger.info("RESUMING FROM CHECKPOINT")
+                self.logger.info(f"  Phase: {checkpoint_state.phase}")
+                self.logger.info(f"  Iteration: {checkpoint_state.iteration}")
+                self.logger.info(f"  Completed gaps: {len(checkpoint_state.completed_gaps)}")
+                self.logger.info("=" * 60)
+
+        # Initialize checkpoint state if not resuming
+        if not checkpoint_state:
+            checkpoint_state = CheckpointState(
+                engine="haploid",
+                phase="init",
+                max_iterations=self.max_iterations
+            )
+            self.checkpoint.save(checkpoint_state)
 
         # Find initial gaps
         initial_gaps = self._find_gaps(current_assembly)
@@ -98,7 +129,13 @@ class HaploidEngine:
 
         # Step 0a: Prepare Hi-C data if available
         if self.hic_reads or self.hic_bam:
-            self.logger.info("STEP 0a: Preparing Hi-C data")
+            # Check if Hi-C BAM already exists
+            existing_hic_bam = self.checkpoint.get_intermediate_file('hic_bam')
+            if existing_hic_bam and self.resume:
+                self.logger.info(f"STEP 0a: Reusing existing Hi-C BAM: {existing_hic_bam}")
+                self.hic_bam = existing_hic_bam
+            else:
+                self.logger.info("STEP 0a: Preparing Hi-C data")
             self._prepare_hic_data(current_assembly)
 
             # Estimate gap sizes using Hi-C
@@ -113,8 +150,15 @@ class HaploidEngine:
 
         # Step 0c: Normalize gaps (skip if already normalized by PolyploidEngine)
         if initial_gaps and not self.skip_normalization:
-            self.logger.info("STEP 0c: Gap Normalization")
-            current_assembly = self._normalize_gaps(current_assembly, initial_gaps)
+            # Check if normalized assembly already exists
+            existing_normalized = self.checkpoint.get_intermediate_file('normalized_assembly')
+            if existing_normalized and self.resume:
+                self.logger.info(f"STEP 0c: Reusing normalized assembly: {existing_normalized}")
+                current_assembly = existing_normalized
+            else:
+                self.logger.info("STEP 0c: Gap Normalization")
+                current_assembly = self._normalize_gaps(current_assembly, initial_gaps)
+                self.checkpoint.set_intermediate_file('normalized_assembly', str(current_assembly))
         elif self.skip_normalization:
             self.logger.info("STEP 0c: Skipping gap normalization (already normalized)")
             # Copy the assembly to output dir for consistency
@@ -122,21 +166,44 @@ class HaploidEngine:
             normalized_file = self.output_dir / "assembly_normalized.fasta"
             shutil.copy(current_assembly, normalized_file)
             current_assembly = normalized_file
+            self.checkpoint.set_intermediate_file('normalized_assembly', str(current_assembly))
 
-        completely_filled_gaps = set()
-        partially_filled_gaps = set()
-        failed_gaps = set()
+        # Update checkpoint phase
+        checkpoint_state.phase = "filling"
+        checkpoint_state.current_assembly = str(current_assembly)
+        self.checkpoint.save(checkpoint_state)
 
+        # Load gap states from checkpoint
+        completely_filled_gaps = self.checkpoint.get_completed_gap_names()
+        partially_filled_gaps = set(checkpoint_state.partially_filled_gaps.keys())
+        failed_gaps = self.checkpoint.get_failed_gap_names()
+
+        # Determine starting iteration
+        if self.resume and checkpoint_state.iteration > 0:
+            start_iteration = self.checkpoint.get_resume_iteration()
+            self.logger.info(f"Resuming from iteration {start_iteration + 1}")
+
+            # Load current assembly from checkpoint
+            if checkpoint_state.current_assembly:
+                checkpoint_assembly = Path(checkpoint_state.current_assembly)
+                if checkpoint_assembly.exists():
+                    current_assembly = checkpoint_assembly
+
+        iteration = start_iteration
         while iteration < self.max_iterations:
             iteration += 1
             self.logger.info(f"\nITERATION {iteration}")
 
+            # Update checkpoint
+            checkpoint_state.iteration = iteration
+            self.checkpoint.save(checkpoint_state)
+
             iter_dir = self.output_dir / f"iteration_{iteration}"
             iter_dir.mkdir(exist_ok=True)
 
-            # Step 1: Align reads
+            # Step 1: Align reads (check for existing BAMs)
             self.logger.info("Step 1: Aligning reads...")
-            hifi_bam, ont_bam = self._align_reads(current_assembly, iter_dir)
+            hifi_bam, ont_bam = self._align_reads_with_cache(current_assembly, iter_dir)
 
             if not hifi_bam and not ont_bam:
                 self.logger.error("No BAM files generated")
@@ -181,7 +248,7 @@ class HaploidEngine:
 
             gap_filler.close()
 
-            # Step 4: Update assembly
+            # Step 4: Update assembly and checkpoint
             new_completely_filled = 0
             new_partially_filled = 0
             new_failed = 0
@@ -192,12 +259,16 @@ class HaploidEngine:
                     if result.get('is_complete', False) and not result.get('has_placeholder', False):
                         completely_filled_gaps.add(gap_name)
                         new_completely_filled += 1
+                        # Save to checkpoint
+                        self.checkpoint.add_completed_gap(gap_name, result.get('sequence', ''))
                     else:
                         partially_filled_gaps.add(gap_name)
                         new_partially_filled += 1
+                        self.checkpoint.add_partial_gap(gap_name, result.get('sequence', ''))
                 else:
                     failed_gaps.add(gap_name)
                     new_failed += 1
+                    self.checkpoint.add_failed_gap(gap_name)
 
             self.logger.info(f"  Complete: {new_completely_filled}, Partial: {new_partially_filled}, Failed: {new_failed}")
 
@@ -205,6 +276,9 @@ class HaploidEngine:
             current_assembly = self._apply_fills(
                 current_assembly, fill_results, iter_dir
             )
+
+            # Update checkpoint with current assembly
+            self.checkpoint.set_current_assembly(str(current_assembly))
 
             # Save iteration stats
             self._save_iteration_stats(iter_dir, iteration, fill_results)
@@ -245,8 +319,37 @@ class HaploidEngine:
 
         self._save_final_stats()
 
+        # Mark checkpoint as complete
+        self.checkpoint.mark_complete()
+        self.logger.info("Checkpoint marked as complete")
+
         self.logger.info(f"\nFinal assembly: {final_assembly}")
         return final_assembly
+
+    def _align_reads_with_cache(self, assembly: Path, output_dir: Path) -> tuple:
+        """Align reads to assembly, reusing existing BAMs if valid"""
+        hifi_bam = None
+        ont_bam = None
+
+        if self.hifi_reads:
+            hifi_bam = output_dir / "hifi.bam"
+            hifi_bai = output_dir / "hifi.bam.bai"
+            # Check if BAM exists and is valid
+            if self.resume and hifi_bam.exists() and hifi_bai.exists() and hifi_bam.stat().st_size > 0:
+                self.logger.info(f"  Reusing existing HiFi BAM: {hifi_bam}")
+            else:
+                self._run_minimap2(assembly, self.hifi_reads, hifi_bam, 'map-hifi')
+
+        if self.ont_reads:
+            ont_bam = output_dir / "ont.bam"
+            ont_bai = output_dir / "ont.bam.bai"
+            # Check if BAM exists and is valid
+            if self.resume and ont_bam.exists() and ont_bai.exists() and ont_bam.stat().st_size > 0:
+                self.logger.info(f"  Reusing existing ONT BAM: {ont_bam}")
+            else:
+                self._run_minimap2(assembly, self.ont_reads, ont_bam, 'map-ont')
+
+        return hifi_bam, ont_bam
 
     def _prepare_hic_data(self, assembly: Path):
         """Prepare Hi-C BAM file and analyzer"""

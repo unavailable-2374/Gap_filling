@@ -14,6 +14,12 @@ python -m gapfill -a hap1.fa hap2.fa --hifi hifi.fq --optimized -o output
 
 # 使用 Hi-C 数据
 python -m gapfill -a assembly.fa --hifi hifi.fq --hic hic_R1.fq hic_R2.fq -o output
+
+# 断点续跑 (中断后恢复)
+python -m gapfill -a assembly.fa --hifi hifi.fq -o output --resume
+
+# 清除断点，重新开始
+python -m gapfill -a assembly.fa --hifi hifi.fq -o output --clear-checkpoint
 ```
 
 ## 核心原则
@@ -44,7 +50,8 @@ gapfill/
     ├── indexer.py            # AssemblyIndexer
     ├── scanner.py            # GapScanner
     ├── tempfiles.py          # TempFileManager
-    └── hic.py                # HiCAnalyzer - Hi-C 数据分析
+    ├── hic.py                # HiCAnalyzer - Hi-C 数据分析
+    └── checkpoint.py         # CheckpointManager - 断点续跑
 ```
 
 ## 核心优化
@@ -110,7 +117,68 @@ TIER 6: Hybrid flanking + 500N → 最后备选
 - `ReadPhaser._identify_haplotype_specific_gaps()` - 识别单倍型独有的 gap
 - `GapRegion` dataclass - gap 元数据
 
-### 4. 批量比对优化 (engines/optimized_polyploid.py)
+### 4. 断点续跑 (utils/checkpoint.py)
+
+**功能：**
+- 中断后从断点恢复，避免重复计算
+- 自动检测已存在的中间文件并复用
+- 跟踪已完成/失败的 gap 填充
+
+**使用方法：**
+```bash
+# 首次运行
+python -m gapfill -a assembly.fa --hifi hifi.fq -o output
+
+# 中断后恢复
+python -m gapfill -a assembly.fa --hifi hifi.fq -o output --resume
+
+# 清除断点，重新开始
+python -m gapfill -a assembly.fa --hifi hifi.fq -o output --clear-checkpoint
+```
+
+**Checkpoint 文件：**
+```
+output/
+└── checkpoint.json       # 断点状态文件
+```
+
+**状态跟踪：**
+
+| 阶段 | 单倍体 | 多倍体 | 可复用文件 |
+|------|--------|--------|-----------|
+| normalization | ✓ | ✓ | assembly_normalized.fasta |
+| snp_detection | - | ✓ | snp_database.json |
+| phasing | - | ✓ | phased_*_hifi.fasta, phased_*_ont.fasta |
+| filling | ✓ | ✓ | iteration_N/*.bam, completed gaps |
+
+**复用逻辑：**
+```
+1. 检查 checkpoint.json 存在
+2. 加载已完成的 gaps 列表
+3. 检查中间文件（BAM、normalized FASTA）是否有效
+4. 从上次中断的迭代恢复
+5. 跳过已完成的 gaps
+```
+
+**CheckpointState 结构：**
+```json
+{
+  "version": "1.0",
+  "engine": "haploid|polyploid|optimized_polyploid",
+  "phase": "init|normalization|phasing|filling|complete",
+  "iteration": 3,
+  "completed_gaps": {"gap_name": "sequence", ...},
+  "failed_gaps": ["gap_name", ...],
+  "current_assembly": "path/to/assembly.fasta",
+  "intermediate_files": {
+    "normalized_assembly": "path",
+    "hifi_bam": "path"
+  },
+  "timestamp": "2024-01-01T00:00:00"
+}
+```
+
+### 5. 批量比对优化 (engines/optimized_polyploid.py)
 
 **原理：**
 ```
@@ -146,6 +214,8 @@ TIER 6: Hybrid flanking + 500N → 最后备选
 --phasing METHOD          # builtin | whatshap
 --no-ambiguous-reads      # 多倍体不使用 ambiguous reads
 --optimized               # 使用批量比对优化 (多倍体)
+--resume                  # 从断点恢复运行
+--clear-checkpoint        # 清除断点，从头开始
 -v, --verbose             # 详细日志
 ```
 
@@ -183,6 +253,7 @@ HaploidEngine(
 **单倍体：**
 ```
 output/
+├── checkpoint.json              # 断点状态文件
 ├── assembly_normalized.fasta
 ├── final_assembly.fasta
 ├── final_stats.json
