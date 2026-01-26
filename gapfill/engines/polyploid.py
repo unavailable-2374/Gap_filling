@@ -269,10 +269,12 @@ class ReadPhaser:
     def _align_assemblies(self, query_file: Path, ref_file: Path, output_bam: Path):
         """Align two assemblies using minimap2 asm5 preset"""
         try:
+            # asm5: for ~0.1% divergence (same-species haplotypes)
+            # -m 8G: memory limit per thread for samtools sort
             cmd = (
-                f"minimap2 -ax asm5 -t {self.threads} --cs "
+                f"minimap2 -ax asm5 -t {self.threads} "
                 f"{ref_file} {query_file} | "
-                f"samtools sort -@ {self.threads} -o {output_bam} - && "
+                f"samtools sort -@ {self.threads} -m 8G -o {output_bam} - && "
                 f"samtools index {output_bam}"
             )
 
@@ -768,9 +770,11 @@ class PolyploidEngine:
                             output_bam: Path, preset: str) -> bool:
         """Align reads to reference for phasing"""
         try:
+            # --secondary=no: ensure unique assignment for phasing
+            # -m 8G: memory limit per thread for samtools sort
             cmd = f"minimap2 -ax {preset} -t {self.threads} --secondary=no " \
                   f"{ref_file} {reads_file} | " \
-                  f"samtools sort -@ {self.threads} -o {output_bam} - && " \
+                  f"samtools sort -@ {self.threads} -m 8G -o {output_bam} - && " \
                   f"samtools index {output_bam}"
 
             subprocess.run(cmd, shell=True, check=True,

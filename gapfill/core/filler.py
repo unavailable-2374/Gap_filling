@@ -739,18 +739,22 @@ class GapFiller:
         output_prefix = work_dir / f"{prefix}_wtdbg2"
 
         # Set parameters based on read type
+        # Biological rationale:
+        # - HiFi: high accuracy (~99.9%), can use lower edge coverage
+        # - ONT: higher error rate, but edge_cov=2 with -S 1 rescues low-cov edges
+        # - min_read_len raised to reduce noise from short fragments
         if read_type == 'hifi':
             preset = 'ccs'
-            edge_cov = 2      # High accuracy, lower coverage needed
-            min_read_len = 500
+            edge_cov = 2
+            min_read_len = 1000   # HiFi reads typically 10-25kb
         elif read_type == 'ont':
             preset = 'ont'
-            edge_cov = 3      # Higher error rate, need more coverage
-            min_read_len = 1000
+            edge_cov = 2          # Lowered from 3, -S 1 will rescue low-cov edges
+            min_read_len = 2000   # ONT reads typically 2-100kb
         else:  # hybrid
-            preset = 'ccs'    # Use ccs for hybrid to maintain accuracy
+            preset = 'ccs'
             edge_cov = 2
-            min_read_len = 500
+            min_read_len = 1000
 
         try:
             if reads_fasta.stat().st_size < 100:
@@ -768,17 +772,25 @@ class GapFiller:
             if read_count < 3:
                 return None
 
-            # Use Hi-C estimated size if available
-            estimated_size = max(total_bases // 50, 10000)
+            # Smarter genome size estimation
+            # Use Hi-C estimate if available, otherwise estimate from read stats
             if gap_info and gap_info.get('name') in self.gap_size_estimates:
                 estimated_size = self.gap_size_estimates[gap_info['name']]
                 self.logger.debug(f"    Using Hi-C estimated size: {estimated_size}bp")
+            elif read_count >= 5:
+                # Use 80% of average read length as estimate
+                avg_read_len = total_bases / read_count
+                estimated_size = max(int(avg_read_len * 0.8), 5000)
+            else:
+                # Low coverage: conservative estimate
+                estimated_size = max(total_bases // 10, 5000)
 
+            # -S 1: rescue low-coverage edges (critical for gap regions)
             result = subprocess.run(
                 ['wtdbg2', '-x', preset, '-g', str(estimated_size),
                  '-t', str(self.threads), '-i', str(reads_fasta),
                  '-o', str(output_prefix), '-L', str(min_read_len),
-                 '-e', str(edge_cov)],
+                 '-e', str(edge_cov), '-S', '1'],
                 capture_output=True, text=True, timeout=300
             )
 

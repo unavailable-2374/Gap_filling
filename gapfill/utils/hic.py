@@ -622,14 +622,16 @@ def align_hic_reads(hic_reads_r1: str, hic_reads_r2: str,
         subprocess.run(['bwa-mem2', 'index', assembly],
                       check=True, capture_output=True)
 
-    # Align with bwa-mem2 (Hi-C mode: -5SP)
+    # Align with bwa-mem2 (Hi-C mode: -5SPM)
     # -5: for split alignments, mark the primary as the shorter one
     # -S: skip mate rescue
     # -P: skip pairing, treat as single-end
-    cmd = (f"bwa-mem2 mem -5SP -t {threads} {assembly} "
+    # -M: mark shorter split hits as secondary (Picard compatibility)
+    # -m 8G: memory limit per thread for samtools sort
+    cmd = (f"bwa-mem2 mem -5SPM -t {threads} {assembly} "
            f"{hic_reads_r1} {hic_reads_r2} | "
            f"samtools view -@ {threads} -bS - | "
-           f"samtools sort -@ {threads} -o {output_bam} -")
+           f"samtools sort -@ {threads} -m 8G -o {output_bam} -")
 
     subprocess.run(cmd, shell=True, check=True, capture_output=True)
 

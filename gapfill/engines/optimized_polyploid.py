@@ -435,8 +435,9 @@ class OptimizedPolyploidEngine:
 
     def _align_reads(self, reads: Path, ref: Path, output_bam: Path, preset: str):
         """Align reads to reference"""
+        # -m 8G: memory limit per thread for samtools sort
         cmd = (f"minimap2 -ax {preset} -t {self.threads} {ref} {reads} | "
-               f"samtools sort -@ {self.threads} -o {output_bam} - && "
+               f"samtools sort -@ {self.threads} -m 8G -o {output_bam} - && "
                f"samtools index {output_bam}")
         subprocess.run(cmd, shell=True, check=True, capture_output=True)
 

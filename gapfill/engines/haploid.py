@@ -356,8 +356,9 @@ class HaploidEngine:
     def _run_minimap2(self, ref: Path, reads: Path, output_bam: Path, preset: str):
         """Run minimap2 alignment"""
         try:
+            # -m 8G: memory limit per thread for samtools sort
             cmd = f"minimap2 -ax {preset} -t {self.threads} {ref} {reads} | " \
-                  f"samtools sort -@ {self.threads} -o {output_bam} - && " \
+                  f"samtools sort -@ {self.threads} -m 8G -o {output_bam} - && " \
                   f"samtools index {output_bam}"
 
             subprocess.run(cmd, shell=True, check=True,
