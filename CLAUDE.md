@@ -235,6 +235,55 @@ output/
 - bwa-mem2 (可选，用于 Hi-C 比对)
 - bcftools, whatshap (多倍体 whatshap 模式)
 
+## 外部工具参数
+
+### wtdbg2 (gap 组装)
+
+| 参数 | HiFi | ONT | 说明 |
+|------|------|-----|------|
+| `-x` | ccs | ont | 读取类型 preset |
+| `-L` | 1000 | 2000 | 最小读长 (减少噪音) |
+| `-e` | 2 | 2 | 边缘覆盖度阈值 |
+| `-S` | 1 | 1 | **关键**: 救回低覆盖度边缘 |
+| `-g` | auto | auto | 基于 reads 或 Hi-C 估计 |
+
+**Genome size 估计逻辑：**
+```
+1. 优先使用 Hi-C 估计值
+2. 否则：avg_read_len * 0.8 (如果 reads >= 5)
+3. 否则：total_bases / 10 (保守估计)
+```
+
+### minimap2 (比对)
+
+| 用途 | Preset | 额外参数 | 说明 |
+|------|--------|----------|------|
+| HiFi → Assembly | map-hifi | - | HiFi 读取比对 |
+| ONT → Assembly | map-ont | - | ONT 读取比对 |
+| Hap → Hap (SNP) | asm5 | - | 同种 haplotype 比对 (~0.1% div) |
+| Phasing | map-hifi/ont | --secondary=no | 唯一分配用于 phasing |
+
+### bwa-mem2 (Hi-C)
+
+```
+bwa-mem2 mem -5SPM -t {threads}
+```
+
+| 参数 | 说明 |
+|------|------|
+| `-5` | split alignments 标记较短为 secondary |
+| `-S` | 跳过 mate rescue |
+| `-P` | 跳过 pairing (Hi-C 特性) |
+| `-M` | Picard 兼容性 |
+
+### samtools sort
+
+```
+samtools sort -@ {threads} -m 8G -o {output} -
+```
+
+- `-m 8G`: 每线程内存限制，防止大文件 OOM
+
 ## 比对次数对比 (多倍体)
 
 | 倍性 | 迭代 | 原始 | 优化 | 减少 |
