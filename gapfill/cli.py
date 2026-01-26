@@ -68,6 +68,12 @@ Examples:
         help="Exclude ambiguous reads in polyploid mode"
     )
     parser.add_argument(
+        "--min-read-snps",
+        type=int,
+        default=1,
+        help="Min SNPs a read must cover for phasing (default: 1)"
+    )
+    parser.add_argument(
         "--optimized",
         action="store_true",
         help="Use optimized batch alignment (reduces alignments by 75%% for polyploid)"
@@ -153,6 +159,7 @@ Examples:
                 threads=args.threads,
                 max_iterations=args.max_iterations,
                 use_ambiguous_reads=not args.no_ambiguous_reads,
+                min_read_snps=args.min_read_snps,
                 resume=args.resume,
                 clear_checkpoint=args.clear_checkpoint
             )
@@ -170,6 +177,7 @@ Examples:
                 max_iterations=args.max_iterations,
                 phasing_method=args.phasing,
                 use_ambiguous_reads=not args.no_ambiguous_reads,
+                min_read_snps=args.min_read_snps,
                 resume=args.resume,
                 clear_checkpoint=args.clear_checkpoint
             )

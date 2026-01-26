@@ -54,7 +54,7 @@ class ReadPhaser:
     def __init__(self, haplotype_assemblies: List[Path],
                  threads: int = 8,
                  min_snp_qual: int = 20,
-                 min_read_snps: int = 2,
+                 min_read_snps: int = 1,  # Reduced from 2 to 1 for better phasing
                  work_dir: Optional[Path] = None):
 
         self.haplotypes = haplotype_assemblies
@@ -71,6 +71,15 @@ class ReadPhaser:
         self.normalized_assemblies: Dict[str, Path] = {}
         self.gap_regions: Dict[str, List[GapRegion]] = {}  # hap_name -> gaps
         self.haplotype_specific_gaps: Dict[str, Set[str]] = {}  # hap_name -> gap names unique to this hap
+
+        # Phasing statistics
+        self.phasing_stats = {
+            'total_snp_positions': 0,
+            'reads_with_0_snps': 0,
+            'reads_with_1_snp': 0,
+            'reads_with_2plus_snps': 0,
+            'reads_with_tie': 0
+        }
 
     def normalize_all_assemblies(self, min_gap_size: int = 100) -> Dict[str, Path]:
         """
@@ -204,16 +213,25 @@ class ReadPhaser:
         Alignment-based SNP detection.
         Aligns each haplotype to hap1 (reference) using minimap2.
         Correctly handles different gap positions between haplotypes.
+
+        IMPORTANT: At each SNP position, we record ALL haplotype bases,
+        not just those that differ from reference. This ensures fair
+        scoring during phasing.
         """
         snp_db = {}
 
         ref_hap = self.hap_names[0]
         ref_file = self.normalized_assemblies[ref_hap]
 
-        # Load reference sequences for gap region detection
-        ref_seqs = {}
-        for record in SeqIO.parse(ref_file, 'fasta'):
-            ref_seqs[record.id] = str(record.seq).upper()
+        # Load ALL haplotype sequences upfront
+        all_hap_seqs = {}
+        for hap_name in self.hap_names:
+            hap_file = self.normalized_assemblies[hap_name]
+            all_hap_seqs[hap_name] = {}
+            for record in SeqIO.parse(hap_file, 'fasta'):
+                all_hap_seqs[hap_name][record.id] = str(record.seq).upper()
+
+        ref_seqs = all_hap_seqs[ref_hap]
 
         # Build gap regions set for quick lookup
         ref_gap_regions = self._build_gap_position_set(ref_seqs)
@@ -228,11 +246,7 @@ class ReadPhaser:
 
             self.logger.info(f"  Aligning {other_hap} to {ref_hap}...")
 
-            # Load other haplotype sequences
-            other_seqs = {}
-            for record in SeqIO.parse(other_file, 'fasta'):
-                other_seqs[record.id] = str(record.seq).upper()
-
+            other_seqs = all_hap_seqs[other_hap]
             other_gap_regions = self._build_gap_position_set(other_seqs)
 
             # Run minimap2 alignment
@@ -251,6 +265,28 @@ class ReadPhaser:
             # Clean up BAM file
             bam_file.unlink(missing_ok=True)
             Path(str(bam_file) + ".bai").unlink(missing_ok=True)
+
+        # CRITICAL: Fill in missing haplotype bases at each SNP position
+        # If hap3 has same base as hap1 at a position, it won't be recorded
+        # during alignment. We need to fill it in now.
+        self.logger.info("  Completing SNP database with all haplotype bases...")
+        positions_completed = 0
+
+        for chrom, positions in snp_db.items():
+            for ref_pos, hap_bases in positions.items():
+                # For each haplotype not in the record, add its base
+                for hap_name in self.hap_names:
+                    if hap_name not in hap_bases:
+                        # Get the base from this haplotype at this position
+                        if chrom in all_hap_seqs[hap_name]:
+                            hap_seq = all_hap_seqs[hap_name][chrom]
+                            if ref_pos < len(hap_seq):
+                                base = hap_seq[ref_pos]
+                                if base != 'N':
+                                    hap_bases[hap_name] = base
+                                    positions_completed += 1
+
+        self.logger.info(f"  Filled {positions_completed} missing haplotype entries")
 
         total_snps = sum(len(positions) for positions in snp_db.values())
         self.logger.info(f"  Total: {total_snps} haplotype-specific SNP positions")
@@ -403,6 +439,11 @@ class ReadPhaser:
                              output_prefix: Path, read_type: str = 'reads') -> Dict[str, Path]:
         """Phase reads based on SNP profiles"""
         self.logger.info(f"Phasing {read_type} reads to haplotypes...")
+        self.logger.info(f"  min_read_snps threshold: {self.min_read_snps}")
+
+        # Count total SNP positions for diagnostics
+        total_snp_positions = sum(len(positions) for positions in snp_db.values())
+        self.logger.info(f"  Total SNP positions in database: {total_snp_positions}")
 
         phased_reads = {hap: [] for hap in self.hap_names}
         ambiguous_reads = []
@@ -410,7 +451,10 @@ class ReadPhaser:
         stats = {
             'total': 0,
             'phased': {hap: 0 for hap in self.hap_names},
-            'ambiguous': 0
+            'ambiguous': 0,
+            'no_snp_overlap': 0,  # Reads that don't overlap any SNP
+            'tie_scores': 0,      # Reads with tied scores
+            'below_threshold': 0  # Reads below min_read_snps
         }
 
         try:
@@ -421,7 +465,7 @@ class ReadPhaser:
 
                     stats['total'] += 1
 
-                    hap_assignment = self._assign_read_to_haplotype(read, snp_db)
+                    hap_assignment, reason = self._assign_read_to_haplotype_detailed(read, snp_db)
 
                     if hap_assignment:
                         phased_reads[hap_assignment].append(read)
@@ -429,6 +473,12 @@ class ReadPhaser:
                     else:
                         ambiguous_reads.append(read)
                         stats['ambiguous'] += 1
+                        if reason == 'no_snp':
+                            stats['no_snp_overlap'] += 1
+                        elif reason == 'tie':
+                            stats['tie_scores'] += 1
+                        elif reason == 'below_threshold':
+                            stats['below_threshold'] += 1
 
         except Exception as e:
             self.logger.error(f"Error phasing reads: {e}")
@@ -447,7 +497,8 @@ class ReadPhaser:
                         f.write(f">{read.query_name}\n{seq}\n")
 
             output_files[hap_name] = output_file
-            self.logger.info(f"  {hap_name}: {stats['phased'][hap_name]} {read_type} reads")
+            pct = stats['phased'][hap_name] / stats['total'] * 100 if stats['total'] > 0 else 0
+            self.logger.info(f"  {hap_name}: {stats['phased'][hap_name]} reads ({pct:.1f}%)")
 
         # Write ambiguous reads
         ambiguous_file = Path(f"{output_prefix}_ambiguous_{read_type}.fasta")
@@ -458,16 +509,29 @@ class ReadPhaser:
                     f.write(f">{read.query_name}\n{seq}\n")
 
         output_files['ambiguous'] = ambiguous_file
-        self.logger.info(f"  Ambiguous: {stats['ambiguous']} {read_type} reads")
+
+        # Detailed statistics
+        total = stats['total']
+        phased_total = sum(stats['phased'].values())
+        self.logger.info(f"  --- Phasing Summary ---")
+        self.logger.info(f"  Total reads: {total}")
+        self.logger.info(f"  Phased: {phased_total} ({phased_total/total*100:.1f}%)" if total > 0 else "  Phased: 0")
+        self.logger.info(f"  Ambiguous: {stats['ambiguous']} ({stats['ambiguous']/total*100:.1f}%)" if total > 0 else "  Ambiguous: 0")
+        self.logger.info(f"    - No SNP overlap: {stats['no_snp_overlap']}")
+        self.logger.info(f"    - Below threshold ({self.min_read_snps}): {stats['below_threshold']}")
+        self.logger.info(f"    - Tied scores: {stats['tie_scores']}")
 
         return output_files
 
-    def _assign_read_to_haplotype(self, read: pysam.AlignedSegment, snp_db: Dict) -> Optional[str]:
-        """Assign a read to a haplotype based on SNP profile"""
+    def _assign_read_to_haplotype_detailed(self, read: pysam.AlignedSegment, snp_db: Dict) -> tuple:
+        """
+        Assign a read to a haplotype based on SNP profile.
+        Returns (haplotype_name, None) or (None, reason).
+        """
         chrom = read.reference_name
 
         if chrom not in snp_db:
-            return None
+            return None, 'no_snp'
 
         hap_scores = {hap: 0 for hap in self.hap_names}
         snps_checked = 0
@@ -481,27 +545,35 @@ class ReadPhaser:
                     snps_checked += 1
                     read_base = read.query_sequence[query_pos].upper()
 
-                    for hap_name, hap_base in snp_db[chrom][ref_pos].items():
-                        if read_base == hap_base:
-                            hap_scores[hap_name] += 1
+                    # Score each haplotype
+                    for hap_name in self.hap_names:
+                        if hap_name in snp_db[chrom][ref_pos]:
+                            hap_base = snp_db[chrom][ref_pos][hap_name]
+                            if read_base == hap_base:
+                                hap_scores[hap_name] += 1
+                        # If haplotype not in database at this position,
+                        # it means we couldn't determine its base (rare after completion)
+                        # Don't penalize, just skip
 
         except Exception:
-            return None
+            return None, 'error'
+
+        if snps_checked == 0:
+            return None, 'no_snp'
 
         if snps_checked < self.min_read_snps:
-            return None
+            return None, 'below_threshold'
 
         max_score = max(hap_scores.values())
         if max_score == 0:
-            return None
+            return None, 'no_match'
 
         best_haps = [h for h, s in hap_scores.items() if s == max_score]
 
         if len(best_haps) == 1:
-            return best_haps[0]
+            return best_haps[0], None
         else:
-            return None
-
+            return None, 'tie'
 
 class PolyploidEngine:
     """
@@ -528,6 +600,7 @@ class PolyploidEngine:
                  phasing_method: str = 'builtin',
                  use_ambiguous_reads: bool = True,
                  min_gap_size: int = 100,
+                 min_read_snps: int = 1,
                  resume: bool = False,
                  clear_checkpoint: bool = False):
 
@@ -543,6 +616,7 @@ class PolyploidEngine:
         self.phasing_method = phasing_method
         self.use_ambiguous_reads = use_ambiguous_reads
         self.min_gap_size = min_gap_size
+        self.min_read_snps = min_read_snps
         self.resume = resume
 
         self.logger = logging.getLogger(__name__)
@@ -624,6 +698,7 @@ class PolyploidEngine:
         phaser = ReadPhaser(
             self.haplotypes,
             threads=self.threads,
+            min_read_snps=self.min_read_snps,
             work_dir=self.output_dir
         )
 

@@ -68,6 +68,7 @@ class OptimizedPolyploidEngine:
                  max_iterations: int = 10,
                  min_gap_size: int = 100,
                  use_ambiguous_reads: bool = True,
+                 min_read_snps: int = 1,
                  resume: bool = False,
                  clear_checkpoint: bool = False):
 
@@ -82,6 +83,7 @@ class OptimizedPolyploidEngine:
         self.max_iterations = max_iterations
         self.min_gap_size = min_gap_size
         self.use_ambiguous_reads = use_ambiguous_reads
+        self.min_read_snps = min_read_snps
         self.resume = resume
 
         self.logger = logging.getLogger(__name__)
@@ -164,7 +166,8 @@ class OptimizedPolyploidEngine:
         self.logger.info("=" * 60)
 
         # Initialize phaser
-        phaser = ReadPhaser(self.haplotypes, self.threads, work_dir=self.output_dir)
+        phaser = ReadPhaser(self.haplotypes, self.threads,
+                            min_read_snps=self.min_read_snps, work_dir=self.output_dir)
 
         # STEP 0: Normalize gaps in ALL haplotypes FIRST
         skip_normalization = False
