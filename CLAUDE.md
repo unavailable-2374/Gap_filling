@@ -89,6 +89,22 @@ TIER 6: Hybrid flanking + 500N → 最后备选
 - `enhance_phasing()` - 长程信息救回 ambiguous reads
 - `get_contact_matrix()` - 获取区域接触矩阵
 
+**多倍体 Hi-C 合并参考比对：**
+```
+原始方式：Hi-C 只比对到 hap1，其他 haplotype 没有 Hi-C 支持
+
+新方式：
+  1. 创建合并参考 (hap1__Chr1, hap2__Chr1, hap3__Chr1, ...)
+  2. Hi-C 比对一次到合并参考
+  3. 按前缀分流 BAM 到各 haplotype
+  4. 每个 haplotype 获得独立的 HiCAnalyzer
+```
+
+**关键方法 (PolyploidEngine/OptimizedPolyploidEngine)：**
+- `_prepare_hic_data()` - 准备 Hi-C 数据（合并参考 + 比对 + 分流）
+- `_create_merged_hic_reference()` - 创建带前缀的合并参考
+- `_split_hic_bam_by_haplotype()` - 按前缀分流 BAM
+
 ### 3. 多倍体 SNP 检测优化 (engines/polyploid.py)
 
 **新流程（解决 gap N 长度不一致问题）：**
@@ -272,6 +288,10 @@ output/
 ├── snp_database.json            # Alignment-based SNP 数据库
 ├── phased_*_hifi.fasta
 ├── phased_*_ont.fasta
+├── merged_hic_reference.fasta   # Hi-C 合并参考 (如果使用 Hi-C)
+├── merged_hic.bam               # Hi-C 比对到合并参考
+├── hap1_hic.bam                 # 分流后的 hap1 Hi-C BAM
+├── hap2_hic.bam                 # 分流后的 hap2 Hi-C BAM
 ├── hap1/
 │   ├── assembly_normalized.fasta  # 符号链接
 │   └── final_assembly.fasta
