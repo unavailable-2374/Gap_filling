@@ -619,8 +619,12 @@ def align_hic_reads(hic_reads_r1: str, hic_reads_r2: str,
     # Index assembly if needed
     if not Path(f"{assembly}.bwt.2bit.64").exists():
         logger.info("  Indexing assembly with bwa-mem2...")
-        subprocess.run(['bwa-mem2', 'index', assembly],
-                      check=True, capture_output=True)
+        try:
+            result = subprocess.run(['bwa-mem2', 'index', assembly],
+                                   check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"bwa-mem2 index failed: {e.stderr}")
+            raise
 
     # Align with bwa-mem2 (Hi-C mode: -5SPM)
     # -5: for split alignments, mark the primary as the shorter one
@@ -633,7 +637,11 @@ def align_hic_reads(hic_reads_r1: str, hic_reads_r2: str,
            f"samtools view -@ {threads} -bS - | "
            f"samtools sort -@ {threads} -m 8G -o {output_bam} -")
 
-    subprocess.run(cmd, shell=True, check=True, capture_output=True)
+    try:
+        subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Hi-C alignment failed: {e.stderr}")
+        raise
 
     # Index BAM
     subprocess.run(['samtools', 'index', str(output_bam)],
