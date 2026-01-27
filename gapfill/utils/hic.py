@@ -631,11 +631,11 @@ def align_hic_reads(hic_reads_r1: str, hic_reads_r2: str,
     # -S: skip mate rescue
     # -P: skip pairing, treat as single-end
     # -M: mark shorter split hits as secondary (Picard compatibility)
-    # -m 8G: memory limit per thread for samtools sort
+    # -m 2G: memory per thread for samtools sort (conservative to avoid OOM)
     cmd = (f"bwa-mem2 mem -5SPM -t {threads} {assembly} "
            f"{hic_reads_r1} {hic_reads_r2} | "
            f"samtools view -@ {threads} -bS - | "
-           f"samtools sort -@ {threads} -m 8G -o {output_bam} -")
+           f"samtools sort -@ {threads} -m 2G -o {output_bam} -")
 
     try:
         subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)

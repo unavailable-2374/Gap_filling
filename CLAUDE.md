@@ -370,10 +370,10 @@ bwa-mem2 mem -5SPM -t {threads}
 ### samtools sort
 
 ```
-samtools sort -@ {threads} -m 8G -o {output} -
+samtools sort -@ {threads} -m 2G -o {output} -
 ```
 
-- `-m 8G`: 每线程内存限制，防止大文件 OOM
+- `-m 2G`: 每线程内存限制，防止大文件 OOM
 
 ## 比对次数对比 (多倍体)
 
