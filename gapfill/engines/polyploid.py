@@ -545,15 +545,22 @@ class ReadPhaser:
                     snps_checked += 1
                     read_base = read.query_sequence[query_pos].upper()
 
+                    # Get reference (hap1) base for fallback
+                    ref_hap = self.hap_names[0]
+                    ref_base_at_pos = snp_db[chrom][ref_pos].get(ref_hap)
+
                     # Score each haplotype
                     for hap_name in self.hap_names:
                         if hap_name in snp_db[chrom][ref_pos]:
                             hap_base = snp_db[chrom][ref_pos][hap_name]
-                            if read_base == hap_base:
-                                hap_scores[hap_name] += 1
-                        # If haplotype not in database at this position,
-                        # it means we couldn't determine its base (rare after completion)
-                        # Don't penalize, just skip
+                        else:
+                            # CRITICAL FIX: If haplotype not in database at this position,
+                            # it means it has the SAME base as reference (hap1).
+                            # Only differences are recorded during SNP detection.
+                            hap_base = ref_base_at_pos
+
+                        if hap_base and read_base == hap_base:
+                            hap_scores[hap_name] += 1
 
         except Exception:
             return None, 'error'
