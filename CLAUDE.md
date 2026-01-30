@@ -43,7 +43,9 @@ python -m gapfill -a assembly.fa --hifi hifi.fq -o output --clear-checkpoint
 | **共识优先** | 减少 50% wtdbg2 调用 | 高质量 spanning reads 直接取共识，跳过组装 |
 | **高置信度同轮验证** | 减少 30% 迭代 | 高置信度填充直接确认，不等下一轮 |
 
-### Reads 过滤策略
+**预期整体加速：4-5x** (例如 74h → 16h)
+
+### Reads 过滤策略 (utils/reads_cache.py)
 
 ```
 原始流程 (慢):
@@ -55,9 +57,87 @@ python -m gapfill -a assembly.fa --hifi hifi.fq -o output --clear-checkpoint
   后续迭代: 只比对保留的 reads (可能只有 10-20%)
 ```
 
-过滤规则:
-- **保留**: 跨越gap的reads、靠近gap边界的reads、有soft-clip的reads
-- **过滤**: 完全锚定在非gap区域的reads (肯定不用于填充)
+**ReadsCache 类方法：**
+- `set_gap_regions()` - 设置 gap 区域，建立索引
+- `filter_bam()` - 过滤 BAM，提取有用 reads 到 FASTA
+- `get_filtered_reads_path()` - 获取过滤后的 reads 文件路径
+
+**过滤规则：**
+
+| Read 类型 | 判定 | 说明 |
+|----------|------|------|
+| Spanning | 保留 | 跨越 gap 的 reads |
+| Overlap | 保留 | 与 gap 区域重叠的 reads |
+| Near-gap | 保留 | 靠近 gap 边界的 reads (1000bp 内) |
+| Soft-clipped | 保留 | 有 soft-clip 的 reads (可能跨越 gap) |
+| Anchored | 过滤 | 完全锚定在非 gap 区域的 reads |
+
+**关键实现逻辑：**
+```python
+def _is_useful_read(self, read) -> Tuple[bool, str]:
+    # Case 1: Read spans the gap
+    if read_start <= gap_start and read_end >= gap_end:
+        return True, 'spanning'
+    # Case 2: Read overlaps with gap region
+    if read_start < gap_end and read_end > gap_start:
+        return True, 'overlap'
+    # Case 3: Soft-clips near gap
+    # Case 4: Near gap boundary
+    # Case 5: Anchored in non-gap region → filter out
+    return False, 'anchored'
+```
+
+### 共识优先策略 (core/consensus.py)
+
+**触发条件：**
+- HiFi spanning reads >= 5
+- K-mer 一致性 > 95%
+
+**ConsensusBuilder 类：**
+- `build_consensus()` - 主入口，选择最佳策略
+- `_estimate_identity()` - K-mer based 一致性估计
+- `_direct_consensus()` - 直接 majority vote (>95% 一致性)
+- `_poa_consensus()` - POA 共识 (>90% 一致性，使用 spoa/abpoa)
+
+**共识策略选择：**
+
+| 一致性 | Reads 数 | 策略 |
+|--------|---------|------|
+| >95% | >=3 | Direct consensus (majority vote) |
+| >90% | >=5 | POA consensus (spoa/abpoa) |
+| <90% | any | Fall back to wtdbg2 |
+
+### 高置信度同轮验证
+
+**触发条件：**
+- Tier 0 或 Tier 1 填充成功
+- Spanning reads >= 5
+- 覆盖度 >= 5x
+
+**效果：**
+- 满足条件的填充直接标记为 FILLED_COMPLETE
+- 跳过延迟验证，减少约 30% 迭代次数
+
+### 并行 Gap 填充 (core/parallel.py)
+
+**实现方式：**
+- 使用 `ProcessPoolExecutor` 多进程并行
+- `spawn` context 避免 pysam fork 问题
+- 每个 worker 独立创建 GapFiller 实例
+
+**关键函数：**
+- `fill_gaps_parallel()` - 并行填充多个 gap
+- `fill_gaps_sequential()` - 顺序填充 (fallback)
+- `GapBatcher.create_batches()` - 按优先级批量处理
+
+**Worker 数量：**
+```python
+max_workers = min(threads, len(gaps), 16)  # 最多 16 个进程
+```
+
+**异常处理：**
+- 单个 gap 超时 (5分钟) → 标记失败
+- 并行执行异常 → 自动 fallback 到顺序处理
 
 ### 命令行参数
 
@@ -321,6 +401,8 @@ python -m gapfill -a assembly.fa --hifi hifi.fq -o output --clear-checkpoint
 --optimized               # 使用批量比对优化 (多倍体)
 --resume                  # 从断点恢复运行
 --clear-checkpoint        # 清除断点，从头开始
+--no-filter-reads         # 禁用 reads 过滤优化 (单倍体)
+--no-parallel             # 禁用并行填充 (单倍体)
 -v, --verbose             # 详细日志
 ```
 

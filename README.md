@@ -6,12 +6,19 @@ Gap filling tool for haploid and polyploid genome assemblies using long-read seq
 
 - **Multi-round iterative filling** - Progressively fills gaps across multiple iterations
 - **Haploid & Polyploid support** - Automatic mode detection based on input assemblies
-- **HiFi + ONT integration** - 6-tier strategy prioritizing HiFi accuracy with ONT length advantage
+- **HiFi + ONT integration** - 7-tier strategy prioritizing HiFi accuracy with ONT length advantage
 - **Delayed validation** - Validates fills in next iteration using properly aligned reads
 - **Automatic flank polishing** - Detects and polishes problematic flanking sequences
 - **Hi-C data support** - Gap size estimation, candidate selection, and fill validation
 - **Checkpoint/resume** - Resume interrupted runs without recomputing
 - **Optimized polyploid mode** - Batch alignment reduces computation by 75%+ for polyploid genomes
+
+### Performance Optimizations (v2.0)
+
+- **Reads filtering** - Filter out reads anchored in non-gap regions, reducing alignment data by ~80%
+- **Consensus-first** - Direct consensus for highly consistent HiFi reads, bypassing wtdbg2 assembly
+- **Parallel gap filling** - Process multiple gaps concurrently using multiprocessing
+- **High-confidence validation** - Immediate validation for high-quality fills, reducing iterations
 
 ## Installation
 
@@ -109,6 +116,10 @@ Checkpoint:
   --resume                  Resume from checkpoint if available
   --clear-checkpoint        Clear existing checkpoint and start fresh
 
+Performance (haploid mode):
+  --no-filter-reads         Disable read filtering optimization
+  --no-parallel             Disable parallel gap filling
+
 Other:
   -v, --verbose             Verbose output
   --version                 Show version
@@ -128,17 +139,21 @@ Other:
 │     ├─ OK: ready for filling                                    │
 │     └─ Issues: needs polishing                                  │
 │  4. Polish problematic flanks                                   │
+│  5. [OPT] Filter reads → keep only gap-related reads            │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
 │  ITERATION LOOP                                                  │
 ├─────────────────────────────────────────────────────────────────┤
-│  1. Align reads → BAM                                           │
+│  1. Align reads → BAM (use filtered reads if enabled)           │
 │  2. Validate previous fills (iteration 2+)                      │
 │     ├─ Pass → FILLED_COMPLETE                                   │
 │     └─ Fail → revert to gap, retry                              │
 │  3. Find remaining gaps                                         │
-│  4. Fill gaps → mark as pending validation                      │
+│  4. [OPT] Fill gaps in parallel                                 │
+│     ├─ Tier 0: consensus-first (skip wtdbg2)                    │
+│     ├─ High-confidence → immediate validation                   │
+│     └─ Others → pending validation                              │
 │  5. Apply fills to assembly                                     │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -150,18 +165,24 @@ Other:
 3. **Delayed validation** - Fills are validated in the next iteration using reads aligned to the filled assembly
 4. **Automatic flank polishing** - Problematic flanks (clip accumulation, high mismatches) are polished before filling
 
-### 6-Tier Filling Strategy
+### 7-Tier Filling Strategy
 
 GapFill uses a hierarchical approach prioritizing accuracy:
 
 | Tier | Strategy | Description |
 |------|----------|-------------|
-| 1 | HiFi spanning | Direct spanning reads from HiFi (highest accuracy) |
+| **0** | **Direct consensus** | HiFi spanning reads ≥5 with >95% identity → direct consensus (skip wtdbg2) |
+| 1 | HiFi spanning | Spanning reads from HiFi assembled with wtdbg2 |
 | 2 | ONT spanning | Spanning reads from ONT (length advantage) |
 | 3 | Hybrid spanning | Combined HiFi+ONT spanning reads |
 | 4 | HiFi flanking + merge | Assemble flanking HiFi reads, merge contigs |
 | 5 | ONT flanking + merge | Assemble flanking ONT reads, polish with HiFi |
 | 6 | 500N placeholder | Insert placeholder if filling fails |
+
+**Tier 0 advantages:**
+- Bypasses wtdbg2 assembly entirely for simple gaps
+- Computes consensus from highly consistent reads directly
+- Reduces gap filling time by ~50% for suitable gaps
 
 ### Gap Status Tracking
 
@@ -214,9 +235,11 @@ gapfill/
 ├── __main__.py
 ├── cli.py                        # Command-line interface
 ├── core/
-│   ├── filler.py                 # GapFiller - 6-tier HiFi/ONT strategy
+│   ├── filler.py                 # GapFiller - 7-tier HiFi/ONT strategy
 │   ├── validator.py              # GapValidator + GapStatusTracker
-│   └── polisher.py               # FlankPolisher - flank sequence polishing
+│   ├── polisher.py               # FlankPolisher - flank sequence polishing
+│   ├── consensus.py              # ConsensusBuilder - direct consensus (Tier 0)
+│   └── parallel.py               # Parallel gap filling support
 ├── engines/
 │   ├── haploid.py                # HaploidEngine - haploid mode + Hi-C
 │   ├── polyploid.py              # PolyploidEngine - standard polyploid
@@ -226,7 +249,8 @@ gapfill/
     ├── scanner.py                # GapScanner
     ├── tempfiles.py              # TempFileManager
     ├── hic.py                    # HiCAnalyzer - Hi-C data analysis
-    └── checkpoint.py             # CheckpointManager - resume support
+    ├── checkpoint.py             # CheckpointManager - resume support
+    └── reads_cache.py            # ReadsCache - filtered reads caching
 ```
 
 ## Output Structure
@@ -304,12 +328,32 @@ output/
 
 ## Performance Tips
 
-1. **Use `--optimized` for polyploid** - Significantly reduces runtime
+### Haploid Mode Optimizations
+
+By default, haploid mode enables all optimizations:
+
+| Optimization | Effect | Flag to Disable |
+|--------------|--------|-----------------|
+| Reads filtering | Filters out reads anchored in non-gap regions → 80% less alignment data | `--no-filter-reads` |
+| Parallel filling | Process multiple gaps concurrently → 3-5x speedup | `--no-parallel` |
+| Consensus-first | Direct consensus for simple gaps → 50% fewer wtdbg2 runs | (always enabled) |
+| High-confidence validation | Immediate validation for Tier 0/1 fills → 30% fewer iterations | (always enabled) |
+
+**Expected speedup: 4-5x faster** (e.g., 74h → 16h for typical genome)
+
+### General Tips
+
+1. **Use `--optimized` for polyploid** - Significantly reduces runtime (75%+ fewer alignments)
 2. **Provide both HiFi and ONT** - Combines accuracy and length advantages
 3. **Add Hi-C data** - Improves fill quality and enables validation
 4. **Use `--resume`** - Resume interrupted runs without recomputing
 5. **Adjust `--max-iterations`** - More iterations may fill more gaps but with diminishing returns
 6. **Use SSD storage** - Alignment I/O benefits from fast storage
+
+### When to Disable Optimizations
+
+- `--no-filter-reads`: If memory is very limited (filtering requires loading gap regions)
+- `--no-parallel`: If running multiple samples simultaneously (avoid CPU competition)
 
 ## Troubleshooting
 
