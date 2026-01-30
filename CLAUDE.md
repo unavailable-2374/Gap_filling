@@ -26,8 +26,8 @@ python -m gapfill -a assembly.fa --hifi hifi.fq -o output --clear-checkpoint
 
 1. **N 长度无意义** - N 序列只是占位符，长度不代表真实 gap 大小
 2. **Gap 标准化** - 所有 N 占位符标准化为 500bp，确保 spanning reads 检测正确
-3. **多轮迭代** - 逐步填充，每轮重新比对 reads
-4. **Supplementary 检测** - 利用 supplementary alignments 发现真正跨 gap 的 reads
+3. **预处理阶段** - 在迭代前完成 normalize、pre-assess、polish
+4. **延迟验证** - 填充后下一轮迭代时用新 BAM 验证
 5. **HiFi 优先** - 6层策略优先使用高准确性 HiFi，ONT 提供长度优势
 6. **多倍体先标准化** - 在 SNP 检测之前先标准化所有 haplotype 的 gap
 7. **Alignment-based SNP 检测** - 使用 minimap2 比对检测 SNP，正确处理 haplotype 独有的 gap
@@ -40,10 +40,11 @@ gapfill/
 ├── __main__.py
 ├── cli.py                    # 命令行解析
 ├── core/
-│   ├── filler.py             # GapFiller - 6层 HiFi/ONT 策略 + Hi-C 辅助
-│   └── validator.py          # GapValidator - 填充验证
+│   ├── filler.py             # GapFiller - 6层 HiFi/ONT 策略
+│   ├── validator.py          # GapValidator + GapStatusTracker
+│   └── polisher.py           # FlankPolisher - 侧翼序列抛光
 ├── engines/
-│   ├── haploid.py            # HaploidEngine - 单倍体引擎 + Hi-C 整合
+│   ├── haploid.py            # HaploidEngine - 单倍体引擎
 │   ├── polyploid.py          # PolyploidEngine - 多倍体引擎
 │   └── optimized_polyploid.py # OptimizedPolyploidEngine - 批量比对优化
 └── utils/
@@ -54,7 +55,80 @@ gapfill/
     └── checkpoint.py         # CheckpointManager - 断点续跑
 ```
 
-## 核心优化
+## 工作流程
+
+### 单倍体工作流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  PREPROCESSING PHASE (一次性，在迭代前)                          │
+├─────────────────────────────────────────────────────────────────┤
+│  0a. Find initial gaps                                          │
+│  0b. Prepare Hi-C data (optional)                               │
+│  0c. Normalize gaps → 500N                                      │
+│  0d. Initial alignment → BAM                                    │
+│  0e. Pre-assess gap flanks                                      │
+│      ├─ PENDING: 侧翼正常                                       │
+│      └─ NEEDS_POLISH: 侧翼有问题                                │
+│  0f. Polish problematic flanks → polished assembly              │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  ITERATION 1                                                     │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Align reads → BAM                                           │
+│  2. (skip validation - no previous fills)                       │
+│  3. Find gaps                                                   │
+│  4. Filter gaps (skip UNFILLABLE, FILLED_*)                     │
+│  5. Fill gaps → mark as FILLED_PENDING                          │
+│  6. Apply fills to assembly                                     │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  ITERATION 2+                                                    │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Align reads → NEW BAM (基于上轮 filled assembly)             │
+│  2. Validate previous fills (用新 BAM)                          │
+│      ├─ 验证通过 → FILLED_COMPLETE/PARTIAL                      │
+│      └─ 验证失败 → 回退填充，恢复 500N gap                       │
+│  3. Find gaps                                                   │
+│  4. Filter gaps                                                 │
+│  5. Fill gaps → FILLED_PENDING                                  │
+│  6. Apply fills                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Gap 状态流转
+
+```
+初始: PENDING
+       │
+预处理 ├──→ NEEDS_POLISH ──→ [Polish] ──→ PENDING
+       │
+迭代 N ├──→ 填充成功 ──→ FILLED_PENDING
+       │                      │
+       │              迭代 N+1 验证
+       │                      │
+       │              ├─ 通过 → FILLED_COMPLETE
+       │              └─ 失败 → FAILED (回退 gap)
+       │
+       └──→ 填充失败 ──→ UNFILLABLE (永久跳过)
+                    └──→ FAILED (下轮重试)
+```
+
+### GapStatus 枚举
+
+| 状态 | 说明 | 下轮操作 |
+|------|------|---------|
+| PENDING | 待处理 | 尝试填充 |
+| NEEDS_POLISH | 侧翼需要 Polish | 预处理阶段 Polish |
+| FILLED_PENDING | 已填充，待验证 | 下轮验证 |
+| FILLED_COMPLETE | 完全填充，已验证 | 跳过 |
+| FILLED_PARTIAL | 部分填充，已验证 | 跳过 |
+| UNFILLABLE | 确认无法填充 | 永久跳过 |
+| FAILED | 填充/验证失败 | 下轮重试 |
+
+## 核心组件
 
 ### 1. 6层 HiFi/ONT 分层策略 (core/filler.py)
 
@@ -73,7 +147,63 @@ TIER 6: Hybrid flanking + 500N → 最后备选
 - `_polish_with_hifi()` - 用 racon 抛光 ONT 组装
 - `_run_wtdbg2_assembly()` - HiFi 用 ccs preset，ONT 用 ont preset
 
-### 2. Hi-C 数据整合 (utils/hic.py)
+### 2. 延迟验证 (core/validator.py)
+
+**为什么需要延迟验证：**
+- 填充时的 BAM 是基于旧 assembly（gap 区域是 N）
+- 验证需要 reads 比对到填充后的序列
+- 下一轮迭代的 BAM 基于 filled assembly，可以准确验证
+
+**GapValidator 类：**
+- `validate_complete_fill()` - 验证完全填充
+- `validate_partial_fill()` - 验证部分填充
+- `pre_assess_gap()` - 预评估单个 gap 侧翼
+- `pre_assess_gaps()` - 批量预评估
+- `analyze_failed_gap()` - 分析失败原因
+
+**验证标准：**
+- Spanning reads 数量（短 gap ≥3，长 gap ≥5）
+- 覆盖度连续性（零覆盖比例 < 10%）
+- 平均覆盖度（≥ 3x）
+- Junction 质量（clip 比例 < 30%）
+
+**GapStatusTracker 类：**
+- `add_pending_fill()` - 添加待验证的填充
+- `get_pending_fills()` - 获取待验证列表
+- `should_attempt()` - 判断是否应该尝试填充
+- `set_status()` - 设置 gap 状态
+
+**PendingFill 数据结构：**
+```python
+@dataclass
+class PendingFill:
+    gap_id: str
+    chrom: str
+    original_start: int
+    original_end: int
+    filled_start: int
+    filled_end: int
+    sequence: str
+    is_complete: bool
+    source: str  # e.g., "hifi_spanning"
+    tier: int
+```
+
+### 3. 侧翼 Polish (core/polisher.py)
+
+**FlankPolisher 类：**
+- `polish_gap_flanks()` - Polish 单个 gap 的侧翼
+- `polish_assembly_flanks()` - 批量 Polish 并更新 assembly
+
+**Polish 方法：**
+1. **Racon polish**（首选）- 使用 racon 进行 consensus 校正
+2. **Pileup consensus**（备选）- 基于 pileup 的多数投票
+
+**触发条件：**
+- Clip accumulation: ≥5 reads 在同一位置 clip
+- High mismatch density: > 5% 错配率
+
+### 4. Hi-C 数据整合 (utils/hic.py)
 
 | 阶段 | Hi-C 作用 | 方法 |
 |------|----------|------|
@@ -83,62 +213,30 @@ TIER 6: Hybrid flanking + 500N → 最后备选
 | **填充后** | 验证填充正确性 | `validate_fills()` |
 | **Phasing** | 增强 reads 分配 | `enhance_phasing()` |
 
-**HiCAnalyzer 类：**
-- `estimate_gap_sizes()` - Hi-C pairs 跨越 gap 推断真实大小
-- `validate_fills()` - 检查接触图连续性
-- `enhance_phasing()` - 长程信息救回 ambiguous reads
-- `get_contact_matrix()` - 获取区域接触矩阵
-
 **多倍体 Hi-C 合并参考比对：**
 ```
-原始方式：Hi-C 只比对到 hap1，其他 haplotype 没有 Hi-C 支持
-
-新方式：
-  1. 创建合并参考 (hap1__Chr1, hap2__Chr1, hap3__Chr1, ...)
-  2. Hi-C 比对一次到合并参考
-  3. 按前缀分流 BAM 到各 haplotype
-  4. 每个 haplotype 获得独立的 HiCAnalyzer
+1. 创建合并参考 (hap1__Chr1, hap2__Chr1, hap3__Chr1, ...)
+2. Hi-C 比对一次到合并参考
+3. 按前缀分流 BAM 到各 haplotype
+4. 每个 haplotype 获得独立的 HiCAnalyzer
 ```
 
-**关键方法 (PolyploidEngine/OptimizedPolyploidEngine)：**
-- `_prepare_hic_data()` - 准备 Hi-C 数据（合并参考 + 比对 + 分流）
-- `_create_merged_hic_reference()` - 创建带前缀的合并参考
-- `_split_hic_bam_by_haplotype()` - 按前缀分流 BAM
+### 5. 多倍体 SNP 检测 (engines/polyploid.py)
 
-### 3. 多倍体 SNP 检测优化 (engines/polyploid.py)
-
-**新流程（解决 gap N 长度不一致问题）：**
+**流程：**
 ```
-原始流程（有bug）：
-  1. SNP 检测 (逐位置比较，gap长度不同导致坐标偏移)
-  2. Gap 标准化
-  3. Phasing
-  4. Gap filling
-
-新流程（已修复）：
-  STEP 0: Gap 标准化 ALL haplotypes (统一为 500N)
-  STEP 1: Alignment-based SNP 检测 (minimap2 asm5)
-  STEP 2: Phasing reads
-  STEP 3: Gap filling (skip_normalization=True)
+STEP 0: Gap 标准化 ALL haplotypes (统一为 500N)
+STEP 1: Alignment-based SNP 检测 (minimap2 asm5)
+STEP 2: Phasing reads
+STEP 3: Gap filling (skip_normalization=True)
 ```
-
-**Alignment-based SNP 检测：**
-- 使用 `minimap2 -ax asm5` 比对 hap2→hap1, hap3→hap1, ...
-- 从 CIGAR 字符串中提取 SNP（跳过 gap 区域）
-- 正确处理 haplotype 独有的 gap
 
 **关键类和方法：**
 - `ReadPhaser.normalize_all_assemblies()` - 标准化所有 haplotype
 - `ReadPhaser._detect_snps_alignment()` - alignment-based SNP 检测
-- `ReadPhaser._identify_haplotype_specific_gaps()` - 识别单倍型独有的 gap
-- `GapRegion` dataclass - gap 元数据
+- `ReadPhaser._assign_read_to_haplotype_detailed()` - SNP-based 分配
 
-### 4. 断点续跑 (utils/checkpoint.py)
-
-**功能：**
-- 中断后从断点恢复，避免重复计算
-- 自动检测已存在的中间文件并复用
-- 跟踪已完成/失败的 gap 填充
+### 6. 断点续跑 (utils/checkpoint.py)
 
 **使用方法：**
 ```bash
@@ -152,68 +250,15 @@ python -m gapfill -a assembly.fa --hifi hifi.fq -o output --resume
 python -m gapfill -a assembly.fa --hifi hifi.fq -o output --clear-checkpoint
 ```
 
-**Checkpoint 文件：**
-```
-output/
-└── checkpoint.json       # 断点状态文件
-```
-
 **状态跟踪：**
 
 | 阶段 | 单倍体 | 多倍体 | 可复用文件 |
 |------|--------|--------|-----------|
 | normalization | ✓ | ✓ | assembly_normalized.fasta |
+| polish | ✓ | ✓ | assembly_polished.fasta |
 | snp_detection | - | ✓ | snp_database.json |
-| phasing | - | ✓ | phased_*_hifi.fasta, phased_*_ont.fasta |
-| filling | ✓ | ✓ | iteration_N/*.bam, completed gaps |
-
-**复用逻辑：**
-```
-1. 检查 checkpoint.json 存在
-2. 加载已完成的 gaps 列表
-3. 检查中间文件（BAM、normalized FASTA）是否有效
-4. 从上次中断的迭代恢复
-5. 跳过已完成的 gaps
-```
-
-**CheckpointState 结构：**
-```json
-{
-  "version": "1.0",
-  "engine": "haploid|polyploid|optimized_polyploid",
-  "phase": "init|normalization|phasing|filling|complete",
-  "iteration": 3,
-  "completed_gaps": {"gap_name": "sequence", ...},
-  "failed_gaps": ["gap_name", ...],
-  "current_assembly": "path/to/assembly.fasta",
-  "intermediate_files": {
-    "normalized_assembly": "path",
-    "hifi_bam": "path"
-  },
-  "timestamp": "2024-01-01T00:00:00"
-}
-```
-
-### 5. 批量比对优化 (engines/optimized_polyploid.py)
-
-**原理：**
-```
-原始：每个 haplotype 每次迭代独立比对
-  4倍体 × 10迭代 × 2类型 = 80 次比对
-
-优化：合并所有 haplotypes，只比对一次
-  10迭代 × 2类型 = 20 次比对 (减少 75%)
-```
-
-**为什么不稀释覆盖度：**
-- Phased reads 带有 SNP 特征
-- 比对到合并参考时，自然选择正确的 haplotype
-- Primary alignment 落在正确目标上
-
-**关键方法：**
-- `_create_merged_reference()` - 合并参考 (hap1__Chr1, hap2__Chr1, ...)
-- `_merge_phased_reads()` - 合并所有 phased reads
-- `_split_bam_by_prefix()` - 按前缀分流 BAM
+| phasing | - | ✓ | phased_*_hifi.fasta |
+| filling | ✓ | ✓ | iteration_N/*.bam |
 
 ## 命令行参数
 
@@ -235,47 +280,22 @@ output/
 -v, --verbose             # 详细日志
 ```
 
-## HaploidEngine 参数
-
-```python
-HaploidEngine(
-    assembly_file: str,
-    hifi_reads: str = None,
-    ont_reads: str = None,
-    hic_reads: List[str] = None,
-    hic_bam: str = None,
-    output_dir: str = "output",
-    threads: int = 8,
-    max_iterations: int = 10,
-    min_gap_size: int = 100,
-    min_mapq: int = 20,
-    skip_normalization: bool = False  # 跳过 gap 标准化（多倍体已预处理）
-)
-```
-
-## 填充策略结果
-
-| Strategy | Source | is_complete | has_placeholder | 说明 |
-|----------|--------|-------------|-----------------|------|
-| spanning | hifi_spanning | True | False | HiFi 直接跨越 |
-| spanning | ont_spanning | True | False | ONT 跨越 |
-| spanning | ont_spanning_hifi_polished | True | False | ONT + HiFi 抛光 |
-| spanning | hybrid_ccs/hybrid_ont | True | False | 混合跨越 |
-| flanking_merged | *_flanking_merged | True | False | 侧翼合并成功 |
-| flanking | *_flanking_500N | False | True | 侧翼 + 500N |
-
 ## 输出结构
 
 **单倍体：**
 ```
 output/
 ├── checkpoint.json              # 断点状态文件
+├── preprocessing/               # 预处理阶段文件
+│   ├── hifi.bam, ont.bam
+│   └── polish_work/
 ├── assembly_normalized.fasta
+├── assembly_polished.fasta      # (如果有 polish)
 ├── final_assembly.fasta
 ├── final_stats.json
-├── hic_aligned.bam              # (如果使用 Hi-C)
 └── iteration_N/
     ├── assembly_filled.fasta
+    ├── assembly_reverted.fasta  # (如果有验证失败)
     ├── hifi.bam, ont.bam
     └── work/gap_*/
 ```
@@ -283,48 +303,17 @@ output/
 **多倍体：**
 ```
 output/
-├── hap1_normalized.fasta        # 标准化后的 haplotype assemblies
+├── hap1_normalized.fasta
 ├── hap2_normalized.fasta
-├── snp_database.json            # Alignment-based SNP 数据库
+├── snp_database.json
 ├── phased_*_hifi.fasta
 ├── phased_*_ont.fasta
-├── merged_hic_reference.fasta   # Hi-C 合并参考 (如果使用 Hi-C)
-├── merged_hic.bam               # Hi-C 比对到合并参考
-├── hap1_hic.bam                 # 分流后的 hap1 Hi-C BAM
-├── hap2_hic.bam                 # 分流后的 hap2 Hi-C BAM
 ├── hap1/
-│   ├── assembly_normalized.fasta  # 符号链接
 │   └── final_assembly.fasta
 ├── hap2/
 │   └── final_assembly.fasta
 └── polyploid_summary.json
 ```
-
-**多倍体 (优化模式)：**
-```
-output/
-├── phase_hifi.bam, phase_ont.bam   # 一次性 phasing
-├── iteration_N/
-│   ├── merged_reference.fasta      # 合并参考
-│   ├── merged_hifi.bam             # 单次比对！
-│   ├── merged_ont.bam
-│   └── hap*/                       # 分流后的各 haplotype
-├── hap1_filled.fasta
-├── hap2_filled.fasta
-└── summary.json
-```
-
-## 依赖
-
-**Python:**
-- biopython, pysam, numpy
-- pyfaidx (可选，强烈推荐)
-
-**External:**
-- minimap2, samtools, wtdbg2, wtpoa-cns
-- racon (可选，用于 HiFi 抛光)
-- bwa-mem2 (可选，用于 Hi-C 比对)
-- bcftools, whatshap (多倍体 whatshap 模式)
 
 ## 外部工具参数
 
@@ -333,17 +322,10 @@ output/
 | 参数 | HiFi | ONT | 说明 |
 |------|------|-----|------|
 | `-x` | ccs | ont | 读取类型 preset |
-| `-L` | 1000 | 2000 | 最小读长 (减少噪音) |
+| `-L` | 1000 | 2000 | 最小读长 |
 | `-e` | 2 | 2 | 边缘覆盖度阈值 |
-| `-S` | 1 | 1 | **关键**: 救回低覆盖度边缘 |
+| `-S` | 1 | 1 | 救回低覆盖度边缘 |
 | `-g` | auto | auto | 基于 reads 或 Hi-C 估计 |
-
-**Genome size 估计逻辑：**
-```
-1. 优先使用 Hi-C 估计值
-2. 否则：avg_read_len * 0.8 (如果 reads >= 5)
-3. 否则：total_bases / 10 (保守估计)
-```
 
 ### minimap2 (比对)
 
@@ -351,21 +333,14 @@ output/
 |------|--------|----------|------|
 | HiFi → Assembly | map-hifi | - | HiFi 读取比对 |
 | ONT → Assembly | map-ont | - | ONT 读取比对 |
-| Hap → Hap (SNP) | asm5 | - | 同种 haplotype 比对 (~0.1% div) |
-| Phasing | map-hifi/ont | --secondary=no | 唯一分配用于 phasing |
+| Hap → Hap (SNP) | asm5 | - | 同种 haplotype 比对 |
+| Phasing | map-hifi/ont | --secondary=no | 唯一分配 |
 
-### bwa-mem2 (Hi-C)
+### racon (Polish)
 
 ```
-bwa-mem2 mem -5SPM -t {threads}
+racon -t {threads} reads.fa align.paf reference.fa
 ```
-
-| 参数 | 说明 |
-|------|------|
-| `-5` | split alignments 标记较短为 secondary |
-| `-S` | 跳过 mate rescue |
-| `-P` | 跳过 pairing (Hi-C 特性) |
-| `-M` | Picard 兼容性 |
 
 ### samtools sort
 
@@ -373,13 +348,15 @@ bwa-mem2 mem -5SPM -t {threads}
 samtools sort -@ {threads} -m 2G -o {output} -
 ```
 
-- `-m 2G`: 每线程内存限制，防止大文件 OOM
+- `-m 2G`: 每线程内存限制，防止 OOM
 
-## 比对次数对比 (多倍体)
+## 依赖
 
-| 倍性 | 迭代 | 原始 | 优化 | 减少 |
-|------|------|------|------|------|
-| 2n | 10 | 40 | 20 | 50% |
-| 4n | 10 | 80 | 20 | 75% |
-| 6n | 10 | 120 | 20 | 83% |
-| 8n | 10 | 160 | 20 | 87.5% |
+**Python:**
+- biopython, pysam, numpy
+
+**External:**
+- minimap2, samtools, wtdbg2, wtpoa-cns
+- racon (Polish 功能)
+- bwa-mem2 (Hi-C 比对)
+- bcftools, whatshap (多倍体 whatshap 模式)
