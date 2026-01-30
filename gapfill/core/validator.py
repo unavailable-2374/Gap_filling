@@ -24,10 +24,11 @@ import numpy as np
 class GapStatus(Enum):
     """Gap filling status"""
     PENDING = "pending"                    # Not yet attempted
+    FILLED_PENDING = "filled_pending"      # Filled, awaiting validation in next iteration
     FILLED_COMPLETE = "filled_complete"    # Completely filled, validated
     FILLED_PARTIAL = "filled_partial"      # Partially filled, validated
     UNFILLABLE = "unfillable"              # Confirmed unfillable (correct flanks, no spanning reads)
-    FAILED = "failed"                      # Failed, may retry after flank polish
+    FAILED = "failed"                      # Failed, may retry
     NEEDS_POLISH = "needs_polish"          # Flanks need polishing before retry
 
 
@@ -652,16 +653,35 @@ class GapValidator:
         return False
 
 
+@dataclass
+class PendingFill:
+    """Information about a fill awaiting validation"""
+    gap_id: str
+    chrom: str
+    original_start: int
+    original_end: int
+    filled_start: int  # New coordinates after filling
+    filled_end: int
+    sequence: str
+    is_complete: bool  # True if no placeholder N's
+    source: str  # e.g., "hifi_spanning", "ont_flanking_merged"
+    tier: int
+
+
 class GapStatusTracker:
     """
-    Tracks gap status across iterations
+    Tracks gap status across iterations.
 
-    Ensures unfillable gaps are skipped in future iterations
+    Key features:
+    - Tracks FILLED_PENDING gaps awaiting validation
+    - Stores fill information for delayed validation
+    - Ensures unfillable gaps are skipped
     """
 
     def __init__(self):
         self._status: Dict[str, GapStatus] = {}
         self._history: Dict[str, List[str]] = defaultdict(list)
+        self._pending_fills: Dict[str, PendingFill] = {}  # gap_id -> fill info
         self.logger = logging.getLogger(__name__)
 
     def get_status(self, gap_id: str) -> GapStatus:
@@ -676,12 +696,54 @@ class GapStatusTracker:
         if status == GapStatus.UNFILLABLE:
             self.logger.info(f"Gap {gap_id} marked as UNFILLABLE - will skip in future iterations")
 
+        # Clear pending fill info if status changes from FILLED_PENDING
+        if status != GapStatus.FILLED_PENDING and gap_id in self._pending_fills:
+            del self._pending_fills[gap_id]
+
+    def add_pending_fill(self, gap_id: str, chrom: str,
+                         original_start: int, original_end: int,
+                         filled_start: int, filled_end: int,
+                         sequence: str, is_complete: bool,
+                         source: str, tier: int):
+        """
+        Add a fill that needs validation in next iteration.
+
+        Args:
+            gap_id: Gap identifier
+            chrom: Chromosome name
+            original_start/end: Original gap coordinates (before fill)
+            filled_start/end: New coordinates (after fill applied)
+            sequence: The filled sequence
+            is_complete: True if completely filled (no N placeholder)
+            source: Fill source (e.g., "hifi_spanning")
+            tier: Fill tier (1-6)
+        """
+        self._pending_fills[gap_id] = PendingFill(
+            gap_id=gap_id,
+            chrom=chrom,
+            original_start=original_start,
+            original_end=original_end,
+            filled_start=filled_start,
+            filled_end=filled_end,
+            sequence=sequence,
+            is_complete=is_complete,
+            source=source,
+            tier=tier
+        )
+        self.set_status(gap_id, GapStatus.FILLED_PENDING,
+                       f"Filled with {source} (tier {tier}), awaiting validation")
+
+    def get_pending_fills(self) -> Dict[str, PendingFill]:
+        """Get all fills awaiting validation"""
+        return self._pending_fills.copy()
+
     def should_attempt(self, gap_id: str) -> bool:
         """Check if gap should be attempted in current iteration"""
         status = self.get_status(gap_id)
 
-        # Skip unfillable and already filled gaps
-        if status in (GapStatus.UNFILLABLE, GapStatus.FILLED_COMPLETE):
+        # Skip: already filled (pending or complete), unfillable
+        if status in (GapStatus.UNFILLABLE, GapStatus.FILLED_COMPLETE,
+                      GapStatus.FILLED_PENDING):
             return False
 
         return True
@@ -703,9 +765,24 @@ class GapStatusTracker:
 
     def to_dict(self) -> Dict:
         """Serialize to dictionary"""
+        pending_fills_dict = {}
+        for gap_id, pf in self._pending_fills.items():
+            pending_fills_dict[gap_id] = {
+                'chrom': pf.chrom,
+                'original_start': pf.original_start,
+                'original_end': pf.original_end,
+                'filled_start': pf.filled_start,
+                'filled_end': pf.filled_end,
+                'sequence': pf.sequence,
+                'is_complete': pf.is_complete,
+                'source': pf.source,
+                'tier': pf.tier
+            }
+
         return {
             'status': {k: v.value for k, v in self._status.items()},
-            'history': dict(self._history)
+            'history': dict(self._history),
+            'pending_fills': pending_fills_dict
         }
 
     @classmethod
@@ -716,4 +793,9 @@ class GapStatusTracker:
             tracker._status[gap_id] = GapStatus(status_str)
         for gap_id, history in data.get('history', {}).items():
             tracker._history[gap_id] = history
+        for gap_id, pf_dict in data.get('pending_fills', {}).items():
+            tracker._pending_fills[gap_id] = PendingFill(
+                gap_id=gap_id,
+                **pf_dict
+            )
         return tracker

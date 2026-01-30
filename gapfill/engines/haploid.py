@@ -24,7 +24,7 @@ from Bio.SeqRecord import SeqRecord
 from Bio.Seq import Seq
 
 from gapfill.core.filler import GapFiller
-from gapfill.core.validator import GapValidator, GapStatusTracker, GapStatus
+from gapfill.core.validator import GapValidator, GapStatusTracker, GapStatus, PendingFill
 from gapfill.utils.hic import HiCAnalyzer, align_hic_reads
 from gapfill.utils.checkpoint import CheckpointManager, CheckpointState
 
@@ -100,7 +100,7 @@ class HaploidEngine:
         self.logger.info("=" * 60)
 
     def run(self) -> Path:
-        """Run iterative gap filling with checkpoint support"""
+        """Run iterative gap filling with delayed validation"""
         current_assembly = self.initial_assembly
         start_iteration = 0
 
@@ -117,15 +117,13 @@ class HaploidEngine:
                     self.logger.info(f"  Completed gaps: {len(checkpoint_state.completed_gaps)}")
                     self.logger.info("=" * 60)
             else:
-                # No checkpoint.json but --resume specified
-                # Scan for existing files from previous run
                 self.logger.info("=" * 60)
                 self.logger.info("No checkpoint.json found, scanning existing files...")
                 checkpoint_state = self.checkpoint.scan_existing_files()
                 if checkpoint_state.phase != "init":
                     self.logger.info(f"  Detected phase: {checkpoint_state.phase}")
                     self.logger.info(f"  Detected iteration: {checkpoint_state.iteration}")
-                    self.checkpoint.save(checkpoint_state)  # Save scanned state
+                    self.checkpoint.save(checkpoint_state)
                 else:
                     self.logger.info("  No usable files found, starting fresh")
                     checkpoint_state = None
@@ -140,51 +138,11 @@ class HaploidEngine:
             )
             self.checkpoint.save(checkpoint_state)
 
-        # Find initial gaps
-        initial_gaps = self._find_gaps(current_assembly)
-        self.stats['total_gaps_initial'] = len(initial_gaps)
-        self.logger.info(f"Initial gaps found: {len(initial_gaps)}")
-
-        # Step 0a: Prepare Hi-C data if available
-        if self.hic_reads or self.hic_bam:
-            # Check if Hi-C BAM already exists
-            existing_hic_bam = self.checkpoint.get_intermediate_file('hic_bam')
-            if existing_hic_bam and self.resume:
-                self.logger.info(f"STEP 0a: Reusing existing Hi-C BAM: {existing_hic_bam}")
-                self.hic_bam = existing_hic_bam
-            else:
-                self.logger.info("STEP 0a: Preparing Hi-C data")
-            self._prepare_hic_data(current_assembly)
-
-            # Estimate gap sizes using Hi-C
-            if self.hic_analyzer and initial_gaps:
-                self.logger.info("STEP 0b: Estimating gap sizes with Hi-C")
-                estimates = self.hic_analyzer.estimate_gap_sizes(initial_gaps)
-                for est in estimates:
-                    if est.confidence in ('high', 'medium'):
-                        self.gap_size_estimates[est.gap_name] = est.estimated_size
-                        self.logger.info(f"  {est.gap_name}: estimated {est.estimated_size}bp "
-                                        f"(was {est.original_size}bp, {est.confidence})")
-
-        # Step 0c: Normalize gaps (skip if already normalized by PolyploidEngine)
-        if initial_gaps and not self.skip_normalization:
-            # Check if normalized assembly already exists
-            existing_normalized = self.checkpoint.get_intermediate_file('normalized_assembly')
-            if existing_normalized and self.resume:
-                self.logger.info(f"STEP 0c: Reusing normalized assembly: {existing_normalized}")
-                current_assembly = existing_normalized
-            else:
-                self.logger.info("STEP 0c: Gap Normalization")
-                current_assembly = self._normalize_gaps(current_assembly, initial_gaps)
-                self.checkpoint.set_intermediate_file('normalized_assembly', str(current_assembly))
-        elif self.skip_normalization:
-            self.logger.info("STEP 0c: Skipping gap normalization (already normalized)")
-            # Copy the assembly to output dir for consistency
-            import shutil
-            normalized_file = self.output_dir / "assembly_normalized.fasta"
-            shutil.copy(current_assembly, normalized_file)
-            current_assembly = normalized_file
-            self.checkpoint.set_intermediate_file('normalized_assembly', str(current_assembly))
+        # =====================================================================
+        # PREPROCESSING PHASE (before iteration loop)
+        # =====================================================================
+        if not self.resume or checkpoint_state.phase == "init":
+            current_assembly = self._run_preprocessing(current_assembly, checkpoint_state)
 
         # Update checkpoint phase
         checkpoint_state.phase = "filling"
@@ -201,25 +159,28 @@ class HaploidEngine:
             start_iteration = self.checkpoint.get_resume_iteration()
             self.logger.info(f"Resuming from iteration {start_iteration + 1}")
 
-            # Load current assembly from checkpoint
             if checkpoint_state.current_assembly:
                 checkpoint_assembly = Path(checkpoint_state.current_assembly)
                 if checkpoint_assembly.exists():
                     current_assembly = checkpoint_assembly
 
+        # =====================================================================
+        # ITERATION LOOP
+        # =====================================================================
         iteration = start_iteration
         while iteration < self.max_iterations:
             iteration += 1
-            self.logger.info(f"\nITERATION {iteration}")
+            self.logger.info(f"\n{'='*60}")
+            self.logger.info(f"ITERATION {iteration}")
+            self.logger.info(f"{'='*60}")
 
-            # Update checkpoint
             checkpoint_state.iteration = iteration
             self.checkpoint.save(checkpoint_state)
 
             iter_dir = self.output_dir / f"iteration_{iteration}"
             iter_dir.mkdir(exist_ok=True)
 
-            # Step 1: Align reads (check for existing BAMs)
+            # Step 1: Align reads
             self.logger.info("Step 1: Aligning reads...")
             hifi_bam, ont_bam = self._align_reads_with_cache(current_assembly, iter_dir)
 
@@ -227,23 +188,18 @@ class HaploidEngine:
                 self.logger.error("No BAM files generated")
                 break
 
-            # Step 2: Find gaps
-            self.logger.info("Step 2: Finding gaps...")
-            gaps = self._find_gaps(current_assembly)
-
-            # Step 2b: Pre-assess gaps and polish if needed (only on first iteration)
-            if iteration == 1 and not self.resume:
-                self.logger.info("Step 2b: Pre-assessing gap flanks...")
-                gaps_needing_polish = self._pre_assess_gaps(gaps, hifi_bam, ont_bam)
-
-                # Step 2c: Polish flanks for gaps that need it
-                if gaps_needing_polish:
-                    self.logger.info("Step 2c: Polishing gap flanks...")
-                    current_assembly = self._polish_gap_flanks(
-                        current_assembly, gaps_needing_polish, hifi_bam, ont_bam, iter_dir
+            # Step 2: Validate previous iteration's fills (if any)
+            if iteration > 1:
+                pending_fills = self.gap_tracker.get_pending_fills()
+                if pending_fills:
+                    self.logger.info(f"Step 2: Validating {len(pending_fills)} fills from previous iteration...")
+                    current_assembly = self._validate_previous_fills(
+                        current_assembly, pending_fills, hifi_bam, ont_bam, iter_dir
                     )
-                    # Re-find gaps after polish (coordinates may have shifted slightly)
-                    gaps = self._find_gaps(current_assembly)
+
+            # Step 3: Find gaps
+            self.logger.info("Step 3: Finding gaps...")
+            gaps = self._find_gaps(current_assembly)
 
             # Use gap tracker to determine which gaps to attempt
             remaining_gaps = [g for g in gaps
@@ -285,69 +241,52 @@ class HaploidEngine:
 
             gap_filler.close()
 
-            # Step 4: Update assembly, checkpoint, and gap tracker
-            new_completely_filled = 0
-            new_partially_filled = 0
-            new_validation_failed = 0
+            # Step 5: Process fill results (DELAYED VALIDATION)
+            new_pending = 0
             new_unfillable = 0
-            new_needs_polish = 0
             new_failed = 0
 
-            # Track which fills passed validation (for applying to assembly)
-            validated_fills = {}
+            # Track successful fills to apply to assembly
+            successful_fills = {}
 
             for gap_name, data in fill_results.items():
+                gap = data['gap']
                 result = data['result']
-                validation = result.get('validation', {})
-                validation_status = validation.get('status', '')
-                validation_valid = validation.get('valid', True)  # Default True if no validation
 
                 if result['success']:
-                    # CONSERVATIVE: Check validation result before accepting fill
-                    if not validation_valid:
-                        # Assembly succeeded but validation failed → reject fill
-                        new_validation_failed += 1
-                        self.gap_tracker.set_status(
-                            gap_name, GapStatus.FAILED,
-                            f"Validation failed: {validation.get('reason', 'Unknown')}"
-                        )
-                        self.logger.warning(f"  Gap {gap_name}: fill rejected (validation failed)")
-                        # Don't add to validated_fills - will retry next iteration
-                        continue
+                    # Fill succeeded → apply and mark as PENDING validation
+                    successful_fills[gap_name] = data
+                    new_pending += 1
 
-                    # Validation passed - accept the fill
-                    validated_fills[gap_name] = data
+                    # Calculate new coordinates (after fill applied)
+                    # For now, use same coordinates - will be updated by _apply_fills
+                    is_complete = result.get('is_complete', False) and not result.get('has_placeholder', False)
 
-                    if result.get('is_complete', False) and not result.get('has_placeholder', False):
-                        completely_filled_gaps.add(gap_name)
-                        new_completely_filled += 1
-                        self.gap_tracker.set_status(
-                            gap_name, GapStatus.FILLED_COMPLETE,
-                            validation.get('reason', 'Fill successful')
-                        )
-                        # Save to checkpoint
-                        self.checkpoint.add_completed_gap(gap_name, result.get('sequence', ''))
-                    else:
-                        partially_filled_gaps.add(gap_name)
-                        new_partially_filled += 1
-                        self.gap_tracker.set_status(
-                            gap_name, GapStatus.FILLED_PARTIAL,
-                            validation.get('reason', 'Partial fill')
-                        )
-                        self.checkpoint.add_partial_gap(gap_name, result.get('sequence', ''))
+                    self.gap_tracker.add_pending_fill(
+                        gap_id=gap_name,
+                        chrom=gap['chrom'],
+                        original_start=gap['start'],
+                        original_end=gap['end'],
+                        filled_start=gap['start'],  # Will be same position in new assembly
+                        filled_end=gap['start'] + len(result.get('sequence', '')),
+                        sequence=result.get('sequence', ''),
+                        is_complete=is_complete,
+                        source=result.get('source', 'unknown'),
+                        tier=result.get('tier', 0)
+                    )
+
+                    self.logger.info(f"    {gap_name}: filled ({result.get('source', 'unknown')}), "
+                                   f"pending validation")
                 else:
-                    # Check validation status for failed gaps
+                    # Fill failed → analyze why
+                    validation = result.get('validation', {})
+                    validation_status = validation.get('status', '')
+
                     if validation_status == 'unfillable':
                         new_unfillable += 1
                         self.gap_tracker.set_status(
                             gap_name, GapStatus.UNFILLABLE,
                             validation.get('reason', 'No spanning reads available')
-                        )
-                    elif validation_status == 'needs_polish':
-                        new_needs_polish += 1
-                        self.gap_tracker.set_status(
-                            gap_name, GapStatus.NEEDS_POLISH,
-                            validation.get('reason', 'Flanks need polishing')
                         )
                     else:
                         new_failed += 1
@@ -359,14 +298,14 @@ class HaploidEngine:
                     failed_gaps.add(gap_name)
                     self.checkpoint.add_failed_gap(gap_name)
 
-            self.logger.info(f"  Complete: {new_completely_filled}, Partial: {new_partially_filled}, "
-                           f"ValidationFailed: {new_validation_failed}, "
-                           f"Unfillable: {new_unfillable}, NeedsPolish: {new_needs_polish}, Failed: {new_failed}")
+            self.logger.info(f"  Filled (pending validation): {new_pending}, "
+                           f"Unfillable: {new_unfillable}, Failed: {new_failed}")
 
-            # Apply only validated fills to assembly
-            current_assembly = self._apply_fills(
-                current_assembly, validated_fills, iter_dir
-            )
+            # Step 6: Apply fills to assembly
+            if successful_fills:
+                current_assembly = self._apply_fills(
+                    current_assembly, successful_fills, iter_dir
+                )
 
             # Update checkpoint with current assembly
             self.checkpoint.set_current_assembly(str(current_assembly))
@@ -374,8 +313,13 @@ class HaploidEngine:
             # Save iteration stats
             self._save_iteration_stats(iter_dir, iteration, fill_results)
 
-            # Check for progress
-            if new_completely_filled == 0 and new_partially_filled == 0:
+            # Log status summary
+            tracker_summary = self.gap_tracker.get_summary()
+            self.logger.info(f"  Status summary: {tracker_summary}")
+
+            # Check for progress (no new fills and no pending validation)
+            pending_count = len(self.gap_tracker.get_pending_fills())
+            if new_pending == 0 and pending_count == 0:
                 self.logger.info("No progress in this iteration, stopping")
                 break
 
@@ -442,6 +386,232 @@ class HaploidEngine:
                 self._run_minimap2(assembly, self.ont_reads, ont_bam, 'map-ont')
 
         return hifi_bam, ont_bam
+
+    def _run_preprocessing(self, assembly: Path, checkpoint_state) -> Path:
+        """
+        Run preprocessing phase before iteration loop.
+
+        Steps:
+        1. Hi-C preparation (if available)
+        2. Gap normalization
+        3. Initial alignment
+        4. Pre-assess gap flanks
+        5. Polish problematic flanks
+        6. Re-align after polish (if needed)
+
+        Returns:
+            Path to preprocessed assembly (normalized and polished)
+        """
+        current_assembly = assembly
+
+        # Step 0a: Find initial gaps
+        initial_gaps = self._find_gaps(current_assembly)
+        self.stats['total_gaps_initial'] = len(initial_gaps)
+        self.logger.info(f"Initial gaps found: {len(initial_gaps)}")
+
+        # Step 0b: Prepare Hi-C data if available
+        if self.hic_reads or self.hic_bam:
+            existing_hic_bam = self.checkpoint.get_intermediate_file('hic_bam')
+            if existing_hic_bam and self.resume:
+                self.logger.info(f"STEP 0b: Reusing existing Hi-C BAM: {existing_hic_bam}")
+                self.hic_bam = existing_hic_bam
+            else:
+                self.logger.info("STEP 0b: Preparing Hi-C data")
+            self._prepare_hic_data(current_assembly)
+
+            # Estimate gap sizes using Hi-C
+            if self.hic_analyzer and initial_gaps:
+                self.logger.info("  Estimating gap sizes with Hi-C...")
+                estimates = self.hic_analyzer.estimate_gap_sizes(initial_gaps)
+                for est in estimates:
+                    if est.confidence in ('high', 'medium'):
+                        self.gap_size_estimates[est.gap_name] = est.estimated_size
+                        self.logger.info(f"    {est.gap_name}: estimated {est.estimated_size}bp")
+
+        # Step 0c: Normalize gaps
+        if initial_gaps and not self.skip_normalization:
+            existing_normalized = self.checkpoint.get_intermediate_file('normalized_assembly')
+            if existing_normalized and self.resume:
+                self.logger.info(f"STEP 0c: Reusing normalized assembly: {existing_normalized}")
+                current_assembly = Path(existing_normalized)
+            else:
+                self.logger.info("STEP 0c: Normalizing gaps to 500N...")
+                current_assembly = self._normalize_gaps(current_assembly, initial_gaps)
+                self.checkpoint.set_intermediate_file('normalized_assembly', str(current_assembly))
+        elif self.skip_normalization:
+            self.logger.info("STEP 0c: Skipping normalization (already done)")
+            import shutil
+            normalized_file = self.output_dir / "assembly_normalized.fasta"
+            shutil.copy(current_assembly, normalized_file)
+            current_assembly = normalized_file
+            self.checkpoint.set_intermediate_file('normalized_assembly', str(current_assembly))
+
+        # Step 0d: Initial alignment for pre-assessment
+        self.logger.info("STEP 0d: Initial alignment for pre-assessment...")
+        preprocess_dir = self.output_dir / "preprocessing"
+        preprocess_dir.mkdir(exist_ok=True)
+        hifi_bam, ont_bam = self._align_reads_with_cache(current_assembly, preprocess_dir)
+
+        if not hifi_bam and not ont_bam:
+            self.logger.warning("  No BAM files for pre-assessment, skipping polish")
+            return current_assembly
+
+        # Step 0e: Pre-assess gap flanks
+        self.logger.info("STEP 0e: Pre-assessing gap flanks...")
+        gaps = self._find_gaps(current_assembly)
+        gaps_needing_polish = self._pre_assess_gaps(gaps, hifi_bam, ont_bam)
+
+        # Step 0f: Polish problematic flanks
+        if gaps_needing_polish:
+            self.logger.info(f"STEP 0f: Polishing {len(gaps_needing_polish)} gap flanks...")
+            polished_assembly = self._polish_gap_flanks(
+                current_assembly, gaps_needing_polish, hifi_bam, ont_bam, preprocess_dir
+            )
+
+            if polished_assembly != current_assembly:
+                current_assembly = polished_assembly
+                self.checkpoint.set_intermediate_file('polished_assembly', str(current_assembly))
+                self.logger.info("  Polishing complete, will re-align in first iteration")
+        else:
+            self.logger.info("STEP 0f: No flanks need polishing")
+
+        return current_assembly
+
+    def _validate_previous_fills(self,
+                                  assembly: Path,
+                                  pending_fills: Dict,
+                                  hifi_bam: Optional[Path],
+                                  ont_bam: Optional[Path],
+                                  output_dir: Path) -> Path:
+        """
+        Validate fills from previous iteration using current BAM.
+
+        For each pending fill:
+        - If validation passes → mark as FILLED_COMPLETE/PARTIAL
+        - If validation fails → revert the fill (restore gap)
+
+        Returns:
+            Path to assembly (may be modified if fills reverted)
+        """
+        validator = GapValidator(threads=self.threads)
+
+        # Prefer HiFi BAM for validation
+        bam_file = None
+        if hifi_bam and hifi_bam.exists():
+            bam_file = str(hifi_bam)
+        elif ont_bam and ont_bam.exists():
+            bam_file = str(ont_bam)
+
+        if not bam_file:
+            self.logger.warning("  No BAM for validation, accepting all fills")
+            for gap_id, pf in pending_fills.items():
+                if pf.is_complete:
+                    self.gap_tracker.set_status(gap_id, GapStatus.FILLED_COMPLETE,
+                                               "Accepted without validation (no BAM)")
+                else:
+                    self.gap_tracker.set_status(gap_id, GapStatus.FILLED_PARTIAL,
+                                               "Accepted without validation (no BAM)")
+            validator.close()
+            return assembly
+
+        validated_count = 0
+        failed_count = 0
+        fills_to_revert = []
+
+        try:
+            for gap_id, pf in pending_fills.items():
+                self.logger.info(f"    Validating {gap_id}...")
+
+                # Validate the filled region
+                if pf.is_complete:
+                    result = validator.validate_complete_fill(
+                        bam_file, pf.chrom, pf.filled_start, pf.filled_end, pf.sequence
+                    )
+                else:
+                    # For partial fills, just check basic coverage
+                    result = validator.validate_complete_fill(
+                        bam_file, pf.chrom, pf.filled_start, pf.filled_end, pf.sequence
+                    )
+
+                if result.valid:
+                    validated_count += 1
+                    if pf.is_complete:
+                        self.gap_tracker.set_status(gap_id, GapStatus.FILLED_COMPLETE,
+                                                   f"Validated: {result.reason}")
+                        self.checkpoint.add_completed_gap(gap_id, pf.sequence)
+                    else:
+                        self.gap_tracker.set_status(gap_id, GapStatus.FILLED_PARTIAL,
+                                                   f"Validated: {result.reason}")
+                        self.checkpoint.add_partial_gap(gap_id, pf.sequence)
+
+                    self.logger.info(f"      ✓ Validated (cov={result.avg_coverage:.1f}x, "
+                                   f"spanning={result.spanning_reads})")
+                else:
+                    failed_count += 1
+                    fills_to_revert.append(pf)
+                    self.gap_tracker.set_status(gap_id, GapStatus.FAILED,
+                                               f"Validation failed: {result.reason}")
+                    self.logger.warning(f"      ✗ Failed: {result.reason}")
+
+        finally:
+            validator.close()
+
+        self.logger.info(f"  Validation complete: {validated_count} passed, {failed_count} failed")
+
+        # Revert failed fills
+        if fills_to_revert:
+            self.logger.info(f"  Reverting {len(fills_to_revert)} failed fills...")
+            assembly = self._revert_fills(assembly, fills_to_revert, output_dir)
+
+        return assembly
+
+    def _revert_fills(self, assembly: Path, fills_to_revert: List, output_dir: Path) -> Path:
+        """
+        Revert failed fills by restoring the original gap (500N).
+
+        This is necessary when a fill fails validation - we need to
+        restore the gap so it can be retried in future iterations.
+        """
+        if not fills_to_revert:
+            return assembly
+
+        reverted_assembly = output_dir / "assembly_reverted.fasta"
+
+        # Load assembly
+        sequences = {}
+        for record in SeqIO.parse(assembly, 'fasta'):
+            sequences[record.id] = str(record.seq)
+
+        # Revert each failed fill (process from end to avoid coordinate shift)
+        fills_by_chrom = {}
+        for pf in fills_to_revert:
+            if pf.chrom not in fills_by_chrom:
+                fills_by_chrom[pf.chrom] = []
+            fills_by_chrom[pf.chrom].append(pf)
+
+        for chrom, fills in fills_by_chrom.items():
+            if chrom not in sequences:
+                continue
+
+            seq = sequences[chrom]
+            # Sort by position, descending
+            fills_sorted = sorted(fills, key=lambda x: x.filled_start, reverse=True)
+
+            for pf in fills_sorted:
+                # Replace filled region with 500N gap
+                seq = seq[:pf.filled_start] + 'N' * 500 + seq[pf.filled_end:]
+                self.logger.info(f"    Reverted {pf.gap_id}: restored 500N gap")
+
+            sequences[chrom] = seq
+
+        # Write reverted assembly
+        with open(reverted_assembly, 'w') as f:
+            for chrom, seq in sequences.items():
+                f.write(f">{chrom}\n")
+                for i in range(0, len(seq), 80):
+                    f.write(seq[i:i+80] + '\n')
+
+        return reverted_assembly
 
     def _prepare_hic_data(self, assembly: Path):
         """Prepare Hi-C BAM file and analyzer"""
