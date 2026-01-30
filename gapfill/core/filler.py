@@ -3,14 +3,16 @@
 Gap Filler - Optimized gap filling with tiered HiFi/ONT strategy
 
 OPTIMIZATIONS:
-1. Tiered strategy: HiFi-only → ONT-only → Hybrid
-2. Different wtdbg2 presets for different read types
-3. Optional HiFi polish for ONT assemblies
-4. Source tracking for quality assessment
-5. Hi-C guided candidate selection when multiple assemblies produced
-6. Integrated validation with flank analysis
+1. Consensus-first: Skip wtdbg2 for high-consistency spanning reads
+2. Tiered strategy: HiFi-only → ONT-only → Hybrid
+3. Different wtdbg2 presets for different read types
+4. Optional HiFi polish for ONT assemblies
+5. Source tracking for quality assessment
+6. Hi-C guided candidate selection when multiple assemblies produced
+7. Integrated validation with flank analysis
 
 Strategy tiers:
+  TIER 0: Direct consensus (for highly consistent spanning reads)
   TIER 1: HiFi-only spanning (highest accuracy)
   TIER 2: ONT-only spanning (+ optional HiFi polish)
   TIER 3: Hybrid spanning
@@ -31,6 +33,7 @@ from Bio import SeqIO
 
 from gapfill.utils.indexer import AssemblyIndexer
 from gapfill.core.validator import GapValidator, GapStatus, ValidationResult
+from gapfill.core.consensus import ConsensusBuilder, try_consensus_fill
 
 if TYPE_CHECKING:
     from gapfill.utils.hic import HiCAnalyzer
@@ -55,6 +58,7 @@ class GapFiller:
                  min_overlap: int = 100,
                  enable_polish: bool = True,
                  enable_validation: bool = True,
+                 enable_consensus_first: bool = True,
                  hic_analyzer: Optional['HiCAnalyzer'] = None,
                  gap_size_estimates: Optional[Dict[str, int]] = None):
 
@@ -71,6 +75,7 @@ class GapFiller:
         self.min_overlap = min_overlap
         self.enable_polish = enable_polish
         self.enable_validation = enable_validation
+        self.enable_consensus_first = enable_consensus_first
         self.hic_analyzer = hic_analyzer
         self.gap_size_estimates = gap_size_estimates or {}
 
@@ -113,6 +118,20 @@ class GapFiller:
                         f"ONT spanning={reads_info['ont_spanning_count']}, "
                         f"HiFi flanking L/R={reads_info['hifi_left_count']}/{reads_info['hifi_right_count']}, "
                         f"ONT flanking L/R={reads_info['ont_left_count']}/{reads_info['ont_right_count']}")
+
+        # =====================================================================
+        # TIER 0: Direct Consensus (skip wtdbg2 for highly consistent reads)
+        # =====================================================================
+        if self.enable_consensus_first and reads_info['hifi_spanning_count'] >= 5:
+            self.logger.info(f"  TIER 0: Trying direct consensus...")
+            consensus_result = try_consensus_fill(
+                reads_info['hifi_spanning'], gap, self.threads
+            )
+            if consensus_result:
+                consensus_result['tier'] = 0
+                self.logger.info(f"  ✓ TIER 0 success: {len(consensus_result['sequence'])}bp "
+                               f"({consensus_result['source']})")
+                return self._finalize_result(consensus_result, gap, reads_info)
 
         # =====================================================================
         # TIER 1: HiFi-only Spanning (highest accuracy)
@@ -1013,6 +1032,23 @@ class GapFiller:
                         bam_file, chrom, gap_start, gap_end, result['sequence']
                     )
 
+            # Determine if this fill can skip delayed validation (high confidence)
+            # Criteria for skipping delayed validation:
+            # - Tier 0 or 1 (HiFi-based)
+            # - High spanning read count (>= 5)
+            # - Good coverage (>= 5x)
+            # - High validation confidence (>= 0.7)
+            tier = result.get('tier', 99)
+            total_spanning = (reads_info.get('hifi_spanning_count', 0) +
+                            reads_info.get('ont_spanning_count', 0))
+            skip_delayed_validation = (
+                tier <= 1 and
+                total_spanning >= 5 and
+                validation.avg_coverage >= 5.0 and
+                validation.confidence >= 0.7 and
+                validation.valid
+            )
+
             # Add validation info to result
             result['validation'] = {
                 'valid': validation.valid,
@@ -1020,13 +1056,19 @@ class GapFiller:
                 'confidence': validation.confidence,
                 'spanning_reads': validation.spanning_reads,
                 'avg_coverage': validation.avg_coverage,
-                'reason': validation.reason
+                'reason': validation.reason,
+                'skip_delayed_validation': skip_delayed_validation
             }
 
-            self.logger.debug(f"    Validation: {validation.status.value} "
-                            f"(confidence={validation.confidence:.2f}, "
-                            f"spanning={validation.spanning_reads}, "
-                            f"cov={validation.avg_coverage:.1f}x)")
+            if skip_delayed_validation:
+                self.logger.info(f"    ✓ High-confidence fill: skip delayed validation "
+                               f"(tier={tier}, spanning={total_spanning}, "
+                               f"cov={validation.avg_coverage:.1f}x)")
+            else:
+                self.logger.debug(f"    Validation: {validation.status.value} "
+                                f"(confidence={validation.confidence:.2f}, "
+                                f"spanning={validation.spanning_reads}, "
+                                f"cov={validation.avg_coverage:.1f}x)")
 
         except Exception as e:
             self.logger.warning(f"Validation error: {e}")

@@ -91,6 +91,18 @@ Examples:
         help="Clear existing checkpoint and start fresh"
     )
 
+    # Performance optimization (haploid mode)
+    parser.add_argument(
+        "--no-filter-reads",
+        action="store_true",
+        help="Disable read filtering optimization (slower but uses less memory)"
+    )
+    parser.add_argument(
+        "--no-parallel",
+        action="store_true",
+        help="Disable parallel gap filling (process gaps sequentially)"
+    )
+
     # Other
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--version", action="version", version="%(prog)s 1.0.0")
@@ -118,6 +130,10 @@ Examples:
     if num_assemblies == 1:
         logger.info("=" * 60)
         logger.info("GapFill - HAPLOID MODE")
+        if not args.no_filter_reads:
+            logger.info("  Optimization: Read filtering enabled")
+        if not args.no_parallel:
+            logger.info("  Optimization: Parallel gap filling enabled")
         logger.info("=" * 60)
 
         from gapfill.engines.haploid import HaploidEngine
@@ -134,7 +150,9 @@ Examples:
             min_gap_size=args.min_gap_size,
             min_mapq=args.min_mapq,
             resume=args.resume,
-            clear_checkpoint=args.clear_checkpoint
+            clear_checkpoint=args.clear_checkpoint,
+            optimized_mode=not args.no_filter_reads,
+            parallel_filling=not args.no_parallel
         )
         result = engine.run()
         logger.info(f"\nOutput: {result}")

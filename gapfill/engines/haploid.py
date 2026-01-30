@@ -6,9 +6,12 @@ Iterative multi-round gap filling for haploid genomes.
 
 Key features:
 1. Gap normalization (all N placeholders -> 500N)
-2. Re-generate BAM files each iteration
-3. Correct coordinate update after each fill
-4. Stop when all fillable gaps are completely filled
+2. OPTIMIZED: One-time alignment + filtered reads cache
+3. OPTIMIZED: Parallel gap filling
+4. OPTIMIZED: Consensus-first strategy (skip wtdbg2 for simple gaps)
+5. OPTIMIZED: High-confidence immediate validation
+6. Correct coordinate update after each fill
+7. Stop when all fillable gaps are completely filled
 """
 
 import logging
@@ -25,8 +28,10 @@ from Bio.Seq import Seq
 
 from gapfill.core.filler import GapFiller
 from gapfill.core.validator import GapValidator, GapStatusTracker, GapStatus, PendingFill
+from gapfill.core.parallel import fill_gaps_parallel, fill_gaps_sequential, GapBatcher
 from gapfill.utils.hic import HiCAnalyzer, align_hic_reads
 from gapfill.utils.checkpoint import CheckpointManager, CheckpointState
+from gapfill.utils.reads_cache import ReadsCache, GapReadsExtractor
 
 
 class HaploidEngine:
@@ -47,7 +52,9 @@ class HaploidEngine:
                  min_mapq: int = 20,
                  skip_normalization: bool = False,
                  resume: bool = False,
-                 clear_checkpoint: bool = False):
+                 clear_checkpoint: bool = False,
+                 optimized_mode: bool = True,
+                 parallel_filling: bool = True):
 
         self.initial_assembly = Path(assembly_file)
         self.hifi_reads = Path(hifi_reads) if hifi_reads else None
@@ -61,6 +68,8 @@ class HaploidEngine:
         self.min_mapq = min_mapq
         self.skip_normalization = skip_normalization
         self.resume = resume
+        self.optimized_mode = optimized_mode
+        self.parallel_filling = parallel_filling
 
         self.logger = logging.getLogger(__name__)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -76,6 +85,11 @@ class HaploidEngine:
 
         # Gap status tracker (tracks UNFILLABLE, NEEDS_POLISH, etc.)
         self.gap_tracker = GapStatusTracker()
+
+        # Reads cache for optimized mode (filter once, use many times)
+        self.reads_cache: Optional[ReadsCache] = None
+        if self.optimized_mode:
+            self.reads_cache = ReadsCache(self.output_dir, threads=threads)
 
         self.stats = {
             'iterations': 0,
@@ -97,6 +111,8 @@ class HaploidEngine:
         self.logger.info(f"  Hi-C BAM: {self.hic_bam}")
         self.logger.info(f"  Output dir: {self.output_dir}")
         self.logger.info(f"  Resume: {self.resume}")
+        self.logger.info(f"  Optimized mode: {self.optimized_mode}")
+        self.logger.info(f"  Parallel filling: {self.parallel_filling}")
         self.logger.info("=" * 60)
 
     def run(self) -> Path:
@@ -180,9 +196,13 @@ class HaploidEngine:
             iter_dir = self.output_dir / f"iteration_{iteration}"
             iter_dir.mkdir(exist_ok=True)
 
-            # Step 1: Align reads
+            # Step 1: Align reads (use filtered reads in optimized mode)
             self.logger.info("Step 1: Aligning reads...")
-            hifi_bam, ont_bam = self._align_reads_with_cache(current_assembly, iter_dir)
+            if self.optimized_mode and self.reads_cache:
+                # Use filtered reads for faster alignment
+                hifi_bam, ont_bam = self._align_filtered_reads(current_assembly, iter_dir)
+            else:
+                hifi_bam, ont_bam = self._align_reads_with_cache(current_assembly, iter_dir)
 
             if not hifi_bam and not ont_bam:
                 self.logger.error("No BAM files generated")
@@ -216,33 +236,66 @@ class HaploidEngine:
                 self.logger.info("No remaining gaps, stopping")
                 break
 
-            # Step 3: Fill gaps
-            self.logger.info("Step 3: Filling gaps...")
+            # Step 4: Fill gaps
+            self.logger.info("Step 4: Filling gaps...")
             work_dir = iter_dir / "work"
             work_dir.mkdir(exist_ok=True)
 
-            gap_filler = GapFiller(
-                assembly_file=str(current_assembly),
-                hifi_bam=str(hifi_bam) if hifi_bam else None,
-                ont_bam=str(ont_bam) if ont_bam else None,
-                hifi_reads=str(self.hifi_reads) if self.hifi_reads else None,
-                ont_reads=str(self.ont_reads) if self.ont_reads else None,
-                threads=self.threads,
-                work_dir=str(work_dir),
-                min_mapq=self.min_mapq,
-                hic_analyzer=self.hic_analyzer,
-                gap_size_estimates=self.gap_size_estimates
-            )
+            if self.parallel_filling and len(remaining_gaps) > 1:
+                # Parallel filling for multiple gaps
+                self.logger.info(f"  Using parallel filling ({self.threads} workers)...")
+                parallel_results = fill_gaps_parallel(
+                    gaps=remaining_gaps,
+                    assembly_file=str(current_assembly),
+                    hifi_bam=str(hifi_bam) if hifi_bam else None,
+                    ont_bam=str(ont_bam) if ont_bam else None,
+                    hifi_reads=str(self.hifi_reads) if self.hifi_reads else None,
+                    ont_reads=str(self.ont_reads) if self.ont_reads else None,
+                    work_dir=str(work_dir),
+                    threads=self.threads,
+                    min_mapq=self.min_mapq,
+                    use_consensus_first=True
+                )
+                # Convert parallel results to expected format
+                fill_results = {}
+                gap_lookup = {g['name']: g for g in remaining_gaps}
+                for gap_name, pr in parallel_results.items():
+                    if pr.get('result'):
+                        fill_results[gap_name] = {
+                            'gap': gap_lookup.get(gap_name, {'name': gap_name}),
+                            'result': pr['result']
+                        }
+                    else:
+                        fill_results[gap_name] = {
+                            'gap': gap_lookup.get(gap_name, {'name': gap_name}),
+                            'result': {'success': False, 'reason': pr.get('error', 'Unknown error')}
+                        }
+            else:
+                # Sequential filling
+                gap_filler = GapFiller(
+                    assembly_file=str(current_assembly),
+                    hifi_bam=str(hifi_bam) if hifi_bam else None,
+                    ont_bam=str(ont_bam) if ont_bam else None,
+                    hifi_reads=str(self.hifi_reads) if self.hifi_reads else None,
+                    ont_reads=str(self.ont_reads) if self.ont_reads else None,
+                    threads=self.threads,
+                    work_dir=str(work_dir),
+                    min_mapq=self.min_mapq,
+                    hic_analyzer=self.hic_analyzer,
+                    gap_size_estimates=self.gap_size_estimates,
+                    enable_consensus_first=True
+                )
 
-            fill_results = {}
-            for gap in remaining_gaps:
-                result = gap_filler.fill_gap(gap)
-                fill_results[gap['name']] = {'gap': gap, 'result': result}
+                fill_results = {}
+                for gap in remaining_gaps:
+                    result = gap_filler.fill_gap(gap)
+                    fill_results[gap['name']] = {'gap': gap, 'result': result}
 
-            gap_filler.close()
+                gap_filler.close()
 
-            # Step 5: Process fill results (DELAYED VALIDATION)
+            # Step 5: Process fill results (with HIGH-CONFIDENCE IMMEDIATE VALIDATION)
             new_pending = 0
+            new_complete = 0  # High-confidence fills that skip delayed validation
             new_unfillable = 0
             new_failed = 0
 
@@ -253,30 +306,42 @@ class HaploidEngine:
                 gap = data['gap']
                 result = data['result']
 
-                if result['success']:
-                    # Fill succeeded → apply and mark as PENDING validation
+                if result.get('success'):
+                    # Fill succeeded
                     successful_fills[gap_name] = data
-                    new_pending += 1
-
-                    # Calculate new coordinates (after fill applied)
-                    # For now, use same coordinates - will be updated by _apply_fills
                     is_complete = result.get('is_complete', False) and not result.get('has_placeholder', False)
 
-                    self.gap_tracker.add_pending_fill(
-                        gap_id=gap_name,
-                        chrom=gap['chrom'],
-                        original_start=gap['start'],
-                        original_end=gap['end'],
-                        filled_start=gap['start'],  # Will be same position in new assembly
-                        filled_end=gap['start'] + len(result.get('sequence', '')),
-                        sequence=result.get('sequence', ''),
-                        is_complete=is_complete,
-                        source=result.get('source', 'unknown'),
-                        tier=result.get('tier', 0)
-                    )
+                    # Check if this fill can skip delayed validation (high confidence)
+                    validation = result.get('validation', {})
+                    skip_delayed = validation.get('skip_delayed_validation', False)
 
-                    self.logger.info(f"    {gap_name}: filled ({result.get('source', 'unknown')}), "
-                                   f"pending validation")
+                    if skip_delayed and is_complete:
+                        # HIGH CONFIDENCE: Mark as FILLED_COMPLETE immediately
+                        new_complete += 1
+                        self.gap_tracker.set_status(
+                            gap_name, GapStatus.FILLED_COMPLETE,
+                            f"High-confidence fill: {result.get('source', 'unknown')} "
+                            f"(tier={result.get('tier', 0)}, cov={validation.get('avg_coverage', 0):.1f}x)"
+                        )
+                        self.checkpoint.add_completed_gap(gap_name, result.get('sequence', ''))
+                        self.logger.info(f"    {gap_name}: ✓ filled & validated ({result.get('source', 'unknown')})")
+                    else:
+                        # Standard: Mark as PENDING validation
+                        new_pending += 1
+                        self.gap_tracker.add_pending_fill(
+                            gap_id=gap_name,
+                            chrom=gap['chrom'],
+                            original_start=gap['start'],
+                            original_end=gap['end'],
+                            filled_start=gap['start'],
+                            filled_end=gap['start'] + len(result.get('sequence', '')),
+                            sequence=result.get('sequence', ''),
+                            is_complete=is_complete,
+                            source=result.get('source', 'unknown'),
+                            tier=result.get('tier', 0)
+                        )
+                        self.logger.info(f"    {gap_name}: filled ({result.get('source', 'unknown')}), "
+                                       f"pending validation")
                 else:
                     # Fill failed → analyze why
                     validation = result.get('validation', {})
@@ -298,7 +363,8 @@ class HaploidEngine:
                     failed_gaps.add(gap_name)
                     self.checkpoint.add_failed_gap(gap_name)
 
-            self.logger.info(f"  Filled (pending validation): {new_pending}, "
+            self.logger.info(f"  Filled (confirmed): {new_complete}, "
+                           f"Filled (pending validation): {new_pending}, "
                            f"Unfillable: {new_unfillable}, Failed: {new_failed}")
 
             # Step 6: Apply fills to assembly
@@ -387,6 +453,55 @@ class HaploidEngine:
 
         return hifi_bam, ont_bam
 
+    def _align_filtered_reads(self, assembly: Path, output_dir: Path) -> tuple:
+        """
+        Align filtered reads to assembly (OPTIMIZED).
+
+        Uses pre-filtered reads from ReadsCache instead of original reads.
+        This significantly reduces alignment time as we only align reads
+        that are potentially useful for gap filling.
+        """
+        hifi_bam = None
+        ont_bam = None
+
+        if not self.reads_cache:
+            # Fall back to regular alignment
+            return self._align_reads_with_cache(assembly, output_dir)
+
+        if self.hifi_reads:
+            hifi_bam = output_dir / "hifi.bam"
+            hifi_bai = output_dir / "hifi.bam.bai"
+
+            if self.resume and hifi_bam.exists() and hifi_bai.exists() and hifi_bam.stat().st_size > 0:
+                self.logger.info(f"  Reusing existing HiFi BAM: {hifi_bam}")
+            else:
+                filtered_fasta = self.reads_cache.get_filtered_reads_path('hifi')
+                if filtered_fasta and filtered_fasta.exists():
+                    self.logger.info(f"  Aligning filtered HiFi reads...")
+                    self._run_minimap2(assembly, filtered_fasta, hifi_bam, 'map-hifi')
+                else:
+                    # No filtered reads, use original
+                    self.logger.info(f"  Aligning original HiFi reads (no cache)...")
+                    self._run_minimap2(assembly, self.hifi_reads, hifi_bam, 'map-hifi')
+
+        if self.ont_reads:
+            ont_bam = output_dir / "ont.bam"
+            ont_bai = output_dir / "ont.bam.bai"
+
+            if self.resume and ont_bam.exists() and ont_bai.exists() and ont_bam.stat().st_size > 0:
+                self.logger.info(f"  Reusing existing ONT BAM: {ont_bam}")
+            else:
+                filtered_fasta = self.reads_cache.get_filtered_reads_path('ont')
+                if filtered_fasta and filtered_fasta.exists():
+                    self.logger.info(f"  Aligning filtered ONT reads...")
+                    self._run_minimap2(assembly, filtered_fasta, ont_bam, 'map-ont')
+                else:
+                    # No filtered reads, use original
+                    self.logger.info(f"  Aligning original ONT reads (no cache)...")
+                    self._run_minimap2(assembly, self.ont_reads, ont_bam, 'map-ont')
+
+        return hifi_bam, ont_bam
+
     def _run_preprocessing(self, assembly: Path, checkpoint_state) -> Path:
         """
         Run preprocessing phase before iteration loop.
@@ -456,14 +571,36 @@ class HaploidEngine:
             self.logger.warning("  No BAM files for pre-assessment, skipping polish")
             return current_assembly
 
-        # Step 0e: Pre-assess gap flanks
-        self.logger.info("STEP 0e: Pre-assessing gap flanks...")
+        # Step 0e: Filter reads (OPTIMIZATION - filter once, use many times)
+        if self.optimized_mode and self.reads_cache:
+            self.logger.info("STEP 0e: Filtering reads (keeping gap-related reads only)...")
+            gaps = self._find_gaps(current_assembly)
+            self.reads_cache.set_gap_regions(gaps)
+
+            if hifi_bam and not self.reads_cache.is_cached('hifi'):
+                self.reads_cache.filter_bam(hifi_bam, 'hifi', self.min_mapq)
+                cache_summary = self.reads_cache.get_summary()
+                self.logger.info(f"  HiFi: kept {cache_summary['hifi']['stats']['kept']:,} / "
+                               f"{cache_summary['hifi']['stats']['total']:,} reads "
+                               f"({cache_summary['hifi']['stats']['kept_ratio']*100:.1f}%)")
+
+            if ont_bam and not self.reads_cache.is_cached('ont'):
+                self.reads_cache.filter_bam(ont_bam, 'ont', self.min_mapq)
+                cache_summary = self.reads_cache.get_summary()
+                self.logger.info(f"  ONT: kept {cache_summary['ont']['stats']['kept']:,} / "
+                               f"{cache_summary['ont']['stats']['total']:,} reads "
+                               f"({cache_summary['ont']['stats']['kept_ratio']*100:.1f}%)")
+
+            self.checkpoint.set_intermediate_file('reads_cache_ready', 'true')
+
+        # Step 0f: Pre-assess gap flanks
+        self.logger.info("STEP 0f: Pre-assessing gap flanks...")
         gaps = self._find_gaps(current_assembly)
         gaps_needing_polish = self._pre_assess_gaps(gaps, hifi_bam, ont_bam)
 
-        # Step 0f: Polish problematic flanks
+        # Step 0g: Polish problematic flanks
         if gaps_needing_polish:
-            self.logger.info(f"STEP 0f: Polishing {len(gaps_needing_polish)} gap flanks...")
+            self.logger.info(f"STEP 0g: Polishing {len(gaps_needing_polish)} gap flanks...")
             polished_assembly = self._polish_gap_flanks(
                 current_assembly, gaps_needing_polish, hifi_bam, ont_bam, preprocess_dir
             )
