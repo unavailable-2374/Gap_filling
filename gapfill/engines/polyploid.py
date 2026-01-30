@@ -787,19 +787,30 @@ class PolyploidEngine:
             # Note: After normalization, all gaps are 500bp
             self.reads_cache.set_gap_regions(all_gaps)
 
-            # First align full reads to get BAM, then filter
+            # Check for existing BAM files first, then filter
+            # Priority: existing hifi_aligned.bam > preprocessing/hifi_full.bam > new alignment
             preprocessing_dir = self.output_dir / "preprocessing"
             preprocessing_dir.mkdir(exist_ok=True)
 
             if self.hifi_reads and not self.reads_cache.is_cached('hifi'):
                 self.logger.info("  Filtering HiFi reads...")
-                # Align full HiFi reads first
+                # Check for existing BAM files
+                existing_hifi_bam = self.output_dir / "hifi_aligned.bam"
                 full_hifi_bam = preprocessing_dir / "hifi_full.bam"
-                if not full_hifi_bam.exists():
+
+                if existing_hifi_bam.exists() and existing_hifi_bam.stat().st_size > 0:
+                    self.logger.info(f"    Reusing existing BAM: {existing_hifi_bam}")
+                    source_bam = existing_hifi_bam
+                elif full_hifi_bam.exists() and full_hifi_bam.stat().st_size > 0:
+                    self.logger.info(f"    Reusing existing BAM: {full_hifi_bam}")
+                    source_bam = full_hifi_bam
+                else:
+                    self.logger.info("    Aligning HiFi reads...")
                     self._align_reads_to_ref(self.hifi_reads, ref_assembly, full_hifi_bam, 'map-hifi')
+                    source_bam = full_hifi_bam
 
                 # Filter BAM to keep only gap-related reads
-                self.reads_cache.filter_bam(full_hifi_bam, 'hifi', min_mapq=20)
+                self.reads_cache.filter_bam(source_bam, 'hifi', min_mapq=20)
                 cache_summary = self.reads_cache.get_summary()
                 self.logger.info(f"  HiFi: kept {cache_summary['hifi']['stats']['kept']:,} / "
                                f"{cache_summary['hifi']['stats']['total']:,} reads "
@@ -807,13 +818,23 @@ class PolyploidEngine:
 
             if self.ont_reads and not self.reads_cache.is_cached('ont'):
                 self.logger.info("  Filtering ONT reads...")
-                # Align full ONT reads first
+                # Check for existing BAM files
+                existing_ont_bam = self.output_dir / "ont_aligned.bam"
                 full_ont_bam = preprocessing_dir / "ont_full.bam"
-                if not full_ont_bam.exists():
+
+                if existing_ont_bam.exists() and existing_ont_bam.stat().st_size > 0:
+                    self.logger.info(f"    Reusing existing BAM: {existing_ont_bam}")
+                    source_bam = existing_ont_bam
+                elif full_ont_bam.exists() and full_ont_bam.stat().st_size > 0:
+                    self.logger.info(f"    Reusing existing BAM: {full_ont_bam}")
+                    source_bam = full_ont_bam
+                else:
+                    self.logger.info("    Aligning ONT reads...")
                     self._align_reads_to_ref(self.ont_reads, ref_assembly, full_ont_bam, 'map-ont')
+                    source_bam = full_ont_bam
 
                 # Filter BAM to keep only gap-related reads
-                self.reads_cache.filter_bam(full_ont_bam, 'ont', min_mapq=20)
+                self.reads_cache.filter_bam(source_bam, 'ont', min_mapq=20)
                 cache_summary = self.reads_cache.get_summary()
                 self.logger.info(f"  ONT: kept {cache_summary['ont']['stats']['kept']:,} / "
                                f"{cache_summary['ont']['stats']['total']:,} reads "
