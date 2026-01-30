@@ -91,16 +91,16 @@ Examples:
         help="Clear existing checkpoint and start fresh"
     )
 
-    # Performance optimization (haploid mode)
+    # Performance optimization
     parser.add_argument(
         "--no-filter-reads",
         action="store_true",
-        help="Disable read filtering optimization (slower but uses less memory)"
+        help="Disable read filtering optimization (applies to all modes)"
     )
     parser.add_argument(
         "--no-parallel",
         action="store_true",
-        help="Disable parallel gap filling (process gaps sequentially)"
+        help="Disable parallel gap filling (haploid mode only)"
     )
 
     # Other
@@ -162,6 +162,8 @@ Examples:
         logger.info(f"GapFill - POLYPLOID MODE ({num_assemblies} haplotypes)")
         if args.optimized:
             logger.info("Using OPTIMIZED batch alignment (75% fewer alignments)")
+        if not args.no_filter_reads:
+            logger.info("  Optimization: Read filtering enabled")
         logger.info("=" * 60)
 
         if args.optimized:
@@ -179,7 +181,8 @@ Examples:
                 use_ambiguous_reads=not args.no_ambiguous_reads,
                 min_read_snps=args.min_read_snps,
                 resume=args.resume,
-                clear_checkpoint=args.clear_checkpoint
+                clear_checkpoint=args.clear_checkpoint,
+                filter_reads=not args.no_filter_reads
             )
         else:
             from gapfill.engines.polyploid import PolyploidEngine
@@ -197,7 +200,8 @@ Examples:
                 use_ambiguous_reads=not args.no_ambiguous_reads,
                 min_read_snps=args.min_read_snps,
                 resume=args.resume,
-                clear_checkpoint=args.clear_checkpoint
+                clear_checkpoint=args.clear_checkpoint,
+                optimized_mode=not args.no_filter_reads
             )
 
         results = engine.run()

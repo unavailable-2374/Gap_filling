@@ -34,6 +34,7 @@ from gapfill.engines.haploid import HaploidEngine
 from gapfill.core.validator import GapStatusTracker, GapStatus
 from gapfill.utils.hic import HiCAnalyzer, align_hic_reads
 from gapfill.utils.checkpoint import PolyploidCheckpointManager, CheckpointState
+from gapfill.utils.reads_cache import ReadsCache
 
 
 @dataclass
@@ -610,7 +611,8 @@ class PolyploidEngine:
                  min_gap_size: int = 100,
                  min_read_snps: int = 1,
                  resume: bool = False,
-                 clear_checkpoint: bool = False):
+                 clear_checkpoint: bool = False,
+                 optimized_mode: bool = True):
 
         self.haplotypes = [Path(h) for h in haplotype_assemblies]
         self.num_haplotypes = len(self.haplotypes)
@@ -626,6 +628,7 @@ class PolyploidEngine:
         self.min_gap_size = min_gap_size
         self.min_read_snps = min_read_snps
         self.resume = resume
+        self.optimized_mode = optimized_mode
 
         self.logger = logging.getLogger(__name__)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -642,6 +645,11 @@ class PolyploidEngine:
         # Store normalized assemblies
         self.normalized_assemblies: Dict[str, Path] = {}
 
+        # Reads cache for optimized mode (filter once, use for phasing)
+        self.reads_cache: Optional[ReadsCache] = None
+        if self.optimized_mode:
+            self.reads_cache = ReadsCache(self.output_dir, threads=threads)
+
         self._validate_inputs()
 
         self.logger.info("=" * 60)
@@ -653,6 +661,7 @@ class PolyploidEngine:
         self.logger.info(f"  Hi-C reads: {self.hic_reads}")
         self.logger.info(f"  Hi-C BAM: {self.hic_bam}")
         self.logger.info(f"  Phasing method: {self.phasing_method}")
+        self.logger.info(f"  Optimized mode: {self.optimized_mode}")
         self.logger.info(f"  Resume: {self.resume}")
         self.logger.info("=" * 60)
 
@@ -754,6 +763,62 @@ class PolyploidEngine:
             self.logger.info("STEP 0b: Preparing Hi-C data")
             self._prepare_hic_data(ref_assembly)
 
+        # Step 0c: Filter reads (OPTIMIZATION - keep only gap-related reads)
+        # Collect gaps from ALL haplotypes for comprehensive filtering
+        if self.optimized_mode and self.reads_cache:
+            self.logger.info("STEP 0c: Filtering reads (keeping gap-related reads only)...")
+
+            # Collect all gaps from all haplotypes
+            all_gaps = []
+            for hap_name in self.hap_names:
+                hap_gaps = phaser.gap_regions.get(hap_name, [])
+                for gap in hap_gaps:
+                    all_gaps.append({
+                        'chrom': gap.chrom,
+                        'start': gap.start,
+                        'end': gap.end,
+                        'size': gap.size,
+                        'name': gap.name
+                    })
+
+            self.logger.info(f"  Total gaps across all haplotypes: {len(all_gaps)}")
+
+            # Set gap regions for filtering (using ref_assembly coordinates)
+            # Note: After normalization, all gaps are 500bp
+            self.reads_cache.set_gap_regions(all_gaps)
+
+            # First align full reads to get BAM, then filter
+            preprocessing_dir = self.output_dir / "preprocessing"
+            preprocessing_dir.mkdir(exist_ok=True)
+
+            if self.hifi_reads and not self.reads_cache.is_cached('hifi'):
+                self.logger.info("  Filtering HiFi reads...")
+                # Align full HiFi reads first
+                full_hifi_bam = preprocessing_dir / "hifi_full.bam"
+                if not full_hifi_bam.exists():
+                    self._align_reads_to_ref(self.hifi_reads, ref_assembly, full_hifi_bam, 'map-hifi')
+
+                # Filter BAM to keep only gap-related reads
+                self.reads_cache.filter_bam(full_hifi_bam, 'hifi', min_mapq=20)
+                cache_summary = self.reads_cache.get_summary()
+                self.logger.info(f"  HiFi: kept {cache_summary['hifi']['stats']['kept']:,} / "
+                               f"{cache_summary['hifi']['stats']['total']:,} reads "
+                               f"({cache_summary['hifi']['stats']['kept_ratio']*100:.1f}%)")
+
+            if self.ont_reads and not self.reads_cache.is_cached('ont'):
+                self.logger.info("  Filtering ONT reads...")
+                # Align full ONT reads first
+                full_ont_bam = preprocessing_dir / "ont_full.bam"
+                if not full_ont_bam.exists():
+                    self._align_reads_to_ref(self.ont_reads, ref_assembly, full_ont_bam, 'map-ont')
+
+                # Filter BAM to keep only gap-related reads
+                self.reads_cache.filter_bam(full_ont_bam, 'ont', min_mapq=20)
+                cache_summary = self.reads_cache.get_summary()
+                self.logger.info(f"  ONT: kept {cache_summary['ont']['stats']['kept']:,} / "
+                               f"{cache_summary['ont']['stats']['total']:,} reads "
+                               f"({cache_summary['ont']['stats']['kept_ratio']*100:.1f}%)")
+
         # Step 1: Detect haplotype-specific SNPs using alignment
         snp_db = None
         skip_snp_detection = False
@@ -803,7 +868,16 @@ class PolyploidEngine:
                 hifi_bam = self.output_dir / "hifi_aligned.bam"
                 # Check if BAM exists
                 if not (self.resume and hifi_bam.exists() and hifi_bam.stat().st_size > 0):
-                    self._align_reads_to_ref(self.hifi_reads, ref_assembly, hifi_bam, 'map-hifi')
+                    # Use filtered reads if available (optimized mode)
+                    if self.optimized_mode and self.reads_cache:
+                        filtered_hifi = self.reads_cache.get_filtered_reads_path('hifi')
+                        if filtered_hifi and filtered_hifi.exists():
+                            self.logger.info("  Using filtered HiFi reads for phasing...")
+                            self._align_reads_to_ref(filtered_hifi, ref_assembly, hifi_bam, 'map-hifi')
+                        else:
+                            self._align_reads_to_ref(self.hifi_reads, ref_assembly, hifi_bam, 'map-hifi')
+                    else:
+                        self._align_reads_to_ref(self.hifi_reads, ref_assembly, hifi_bam, 'map-hifi')
                 else:
                     self.logger.info(f"  Reusing existing BAM: {hifi_bam}")
 
@@ -820,7 +894,16 @@ class PolyploidEngine:
                 ont_bam = self.output_dir / "ont_aligned.bam"
                 # Check if BAM exists
                 if not (self.resume and ont_bam.exists() and ont_bam.stat().st_size > 0):
-                    self._align_reads_to_ref(self.ont_reads, ref_assembly, ont_bam, 'map-ont')
+                    # Use filtered reads if available (optimized mode)
+                    if self.optimized_mode and self.reads_cache:
+                        filtered_ont = self.reads_cache.get_filtered_reads_path('ont')
+                        if filtered_ont and filtered_ont.exists():
+                            self.logger.info("  Using filtered ONT reads for phasing...")
+                            self._align_reads_to_ref(filtered_ont, ref_assembly, ont_bam, 'map-ont')
+                        else:
+                            self._align_reads_to_ref(self.ont_reads, ref_assembly, ont_bam, 'map-ont')
+                    else:
+                        self._align_reads_to_ref(self.ont_reads, ref_assembly, ont_bam, 'map-ont')
                 else:
                     self.logger.info(f"  Reusing existing BAM: {ont_bam}")
 

@@ -116,9 +116,9 @@ Checkpoint:
   --resume                  Resume from checkpoint if available
   --clear-checkpoint        Clear existing checkpoint and start fresh
 
-Performance (haploid mode):
-  --no-filter-reads         Disable read filtering optimization
-  --no-parallel             Disable parallel gap filling
+Performance:
+  --no-filter-reads         Disable read filtering optimization (all modes)
+  --no-parallel             Disable parallel gap filling (haploid only)
 
 Other:
   -v, --verbose             Verbose output
@@ -207,6 +207,19 @@ When Hi-C data is provided:
 | Polyploid | Enhance phasing | Long-range haplotype links |
 
 ### Polyploid Optimization
+
+**Reads Filtering (default enabled):**
+
+By default, polyploid mode filters reads before phasing:
+```
+1. Align full reads to reference haplotype (once)
+2. Filter out reads anchored in non-gap regions
+3. Use filtered reads for phasing and gap filling
+```
+
+This reduces alignment data by ~80%, significantly speeding up the phasing step.
+
+**Batch Alignment (--optimized flag):**
 
 The `--optimized` flag enables batch alignment:
 
@@ -352,8 +365,8 @@ By default, haploid mode enables all optimizations:
 
 ### When to Disable Optimizations
 
-- `--no-filter-reads`: If memory is very limited (filtering requires loading gap regions)
-- `--no-parallel`: If running multiple samples simultaneously (avoid CPU competition)
+- `--no-filter-reads`: If memory is very limited (filtering requires loading gap regions). Applies to all modes.
+- `--no-parallel`: If running multiple samples simultaneously (avoid CPU competition). Haploid mode only.
 
 ## Troubleshooting
 

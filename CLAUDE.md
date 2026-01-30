@@ -215,6 +215,23 @@ gapfill/
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### 多倍体工作流程 (优化版)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 0: Normalize ALL haplotypes → 500N                        │
+│  STEP 0b: Prepare Hi-C data (optional)                          │
+│  STEP 0c: [优化] Filter reads                                   │
+│      ├─ 全量比对一次到 ref_haplotype                            │
+│      └─ 过滤掉锚定在非gap区域的reads                            │
+│  STEP 1: SNP detection (alignment-based)                        │
+│  STEP 2: Phase reads (使用过滤后的reads)                        │
+│      ├─ HiFi reads → phased_hap1_hifi.fa, phased_hap2_hifi.fa   │
+│      └─ ONT reads → phased_hap1_ont.fa, phased_hap2_ont.fa      │
+│  STEP 3: Gap filling per haplotype                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
 ### Gap 状态流转
 
 ```
