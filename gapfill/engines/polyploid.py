@@ -1262,6 +1262,10 @@ class PolyploidEngine:
         self.logger.info(f"    Hi-C BAM: {hic_bam}")
         self.logger.info(f"    Skip normalization: {skip_normalization}")
 
+        # Note: Disable reads filtering in HaploidEngine because:
+        # 1. Reads are already filtered at polyploid STEP 0c
+        # 2. Phased reads are already a subset of gap-related reads
+        # But keep parallel filling enabled for speedup
         engine = HaploidEngine(
             assembly_file=str(assembly),
             hifi_reads=str(hifi_reads) if hifi_reads else None,
@@ -1270,7 +1274,9 @@ class PolyploidEngine:
             output_dir=str(output_dir),
             threads=self.threads,
             max_iterations=self.max_iterations,
-            skip_normalization=skip_normalization
+            skip_normalization=skip_normalization,
+            optimized_mode=False,  # Reads already filtered at polyploid level
+            parallel_filling=True   # Keep parallel gap filling
         )
 
         return engine.run()
