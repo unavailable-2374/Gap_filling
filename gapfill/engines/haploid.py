@@ -231,6 +231,11 @@ class HaploidEngine:
             self.logger.info("Step 2: Finding gaps...")
             gaps = self._find_gaps(current_assembly)
 
+            # Step 2b: Pre-assess gaps (only on first iteration)
+            if iteration == 1 and not self.resume:
+                self.logger.info("Step 2b: Pre-assessing gap flanks...")
+                self._pre_assess_gaps(gaps, hifi_bam, ont_bam)
+
             # Use gap tracker to determine which gaps to attempt
             remaining_gaps = [g for g in gaps
                             if self.gap_tracker.should_attempt(g['name'])]
@@ -274,16 +279,36 @@ class HaploidEngine:
             # Step 4: Update assembly, checkpoint, and gap tracker
             new_completely_filled = 0
             new_partially_filled = 0
+            new_validation_failed = 0
             new_unfillable = 0
             new_needs_polish = 0
             new_failed = 0
+
+            # Track which fills passed validation (for applying to assembly)
+            validated_fills = {}
 
             for gap_name, data in fill_results.items():
                 result = data['result']
                 validation = result.get('validation', {})
                 validation_status = validation.get('status', '')
+                validation_valid = validation.get('valid', True)  # Default True if no validation
 
                 if result['success']:
+                    # CONSERVATIVE: Check validation result before accepting fill
+                    if not validation_valid:
+                        # Assembly succeeded but validation failed → reject fill
+                        new_validation_failed += 1
+                        self.gap_tracker.set_status(
+                            gap_name, GapStatus.FAILED,
+                            f"Validation failed: {validation.get('reason', 'Unknown')}"
+                        )
+                        self.logger.warning(f"  Gap {gap_name}: fill rejected (validation failed)")
+                        # Don't add to validated_fills - will retry next iteration
+                        continue
+
+                    # Validation passed - accept the fill
+                    validated_fills[gap_name] = data
+
                     if result.get('is_complete', False) and not result.get('has_placeholder', False):
                         completely_filled_gaps.add(gap_name)
                         new_completely_filled += 1
@@ -326,11 +351,12 @@ class HaploidEngine:
                     self.checkpoint.add_failed_gap(gap_name)
 
             self.logger.info(f"  Complete: {new_completely_filled}, Partial: {new_partially_filled}, "
+                           f"ValidationFailed: {new_validation_failed}, "
                            f"Unfillable: {new_unfillable}, NeedsPolish: {new_needs_polish}, Failed: {new_failed}")
 
-            # Apply fills to assembly
+            # Apply only validated fills to assembly
             current_assembly = self._apply_fills(
-                current_assembly, fill_results, iter_dir
+                current_assembly, validated_fills, iter_dir
             )
 
             # Update checkpoint with current assembly
@@ -598,6 +624,55 @@ class HaploidEngine:
         self.logger.info(f"  Completely filled: {self.stats['gaps_completely_filled']}")
         self.logger.info(f"  Partially filled: {self.stats['gaps_partially_filled']}")
         self.logger.info(f"  Failed: {self.stats['gaps_failed']}")
+
+    def _pre_assess_gaps(self, gaps: List[Dict], hifi_bam: Optional[Path], ont_bam: Optional[Path]):
+        """
+        Pre-assess all gaps before first filling iteration.
+
+        Analyzes flank quality for each gap and marks those needing polish.
+        This helps identify problematic gaps early and avoids wasting compute
+        on gaps that will fail due to flank issues.
+        """
+        # Prefer HiFi BAM for assessment (more accurate)
+        bam_file = None
+        if hifi_bam and hifi_bam.exists():
+            bam_file = str(hifi_bam)
+        elif ont_bam and ont_bam.exists():
+            bam_file = str(ont_bam)
+
+        if not bam_file:
+            self.logger.warning("  No BAM file available for pre-assessment, skipping")
+            return
+
+        validator = GapValidator(threads=self.threads)
+
+        try:
+            results = validator.pre_assess_gaps(bam_file, gaps)
+
+            needs_polish_count = 0
+            ready_count = 0
+
+            for gap_name, result in results.items():
+                if result.status == GapStatus.NEEDS_POLISH:
+                    needs_polish_count += 1
+                    self.gap_tracker.set_status(
+                        gap_name, GapStatus.NEEDS_POLISH,
+                        result.reason
+                    )
+                    self.logger.info(f"    {gap_name}: NEEDS_POLISH - {result.reason}")
+                else:
+                    ready_count += 1
+                    # Keep as PENDING (default), don't need to set
+
+            self.logger.info(f"  Pre-assessment: {ready_count} ready, {needs_polish_count} need polish")
+
+            # Update stats
+            self.stats['gaps_needs_polish'] = needs_polish_count
+
+        except Exception as e:
+            self.logger.warning(f"  Pre-assessment error: {e}")
+        finally:
+            validator.close()
 
 
 # Backwards compatibility

@@ -308,6 +308,105 @@ class GapValidator:
             reason=reason
         )
 
+    def pre_assess_gap(
+        self,
+        bam_file: str,
+        chrom: str,
+        gap_start: int,
+        gap_end: int
+    ) -> ValidationResult:
+        """
+        Pre-assess a gap BEFORE attempting to fill it.
+
+        This should be called before the first filling iteration to identify
+        gaps that need flank polishing or reassembly before filling can succeed.
+
+        Returns:
+        - PENDING: Flanks look good, can attempt filling
+        - NEEDS_POLISH: Flanks have issues (clip accumulation, high mismatches)
+        - FAILED: Cannot assess (BAM unavailable)
+        """
+        bam = self._get_bam(bam_file)
+        if bam is None:
+            return ValidationResult(
+                valid=True,
+                status=GapStatus.PENDING,
+                reason="Cannot open BAM file for pre-assessment, will attempt filling"
+            )
+
+        # Analyze left flank
+        left_flank = self._analyze_flank(
+            bam, chrom,
+            max(0, gap_start - self.FLANK_ANALYSIS_SIZE),
+            gap_start,
+            is_left=True
+        )
+
+        # Analyze right flank
+        right_flank = self._analyze_flank(
+            bam, chrom,
+            gap_end,
+            gap_end + self.FLANK_ANALYSIS_SIZE,
+            is_left=False
+        )
+
+        # Combine analysis
+        needs_polish = left_flank.needs_polish or right_flank.needs_polish
+        flank_issues = left_flank.issues + right_flank.issues
+
+        if needs_polish:
+            return ValidationResult(
+                valid=False,
+                status=GapStatus.NEEDS_POLISH,
+                left_flank_needs_polish=left_flank.needs_polish,
+                right_flank_needs_polish=right_flank.needs_polish,
+                flank_issues=flank_issues,
+                reason=f"Pre-assessment: flanks need polishing - {'; '.join(flank_issues)}"
+            )
+        else:
+            return ValidationResult(
+                valid=True,
+                status=GapStatus.PENDING,
+                left_flank_needs_polish=False,
+                right_flank_needs_polish=False,
+                flank_issues=[],
+                reason="Pre-assessment: flanks look good, ready for filling"
+            )
+
+    def pre_assess_gaps(
+        self,
+        bam_file: str,
+        gaps: List[Dict]
+    ) -> Dict[str, ValidationResult]:
+        """
+        Pre-assess multiple gaps before filling.
+
+        Args:
+            bam_file: BAM file for analysis
+            gaps: List of gap dictionaries with 'chrom', 'start', 'end', 'name'
+
+        Returns:
+            Dict mapping gap_name to ValidationResult
+        """
+        results = {}
+        needs_polish_count = 0
+        ready_count = 0
+
+        for gap in gaps:
+            gap_name = gap.get('name', f"{gap['chrom']}_{gap['start']}_{gap['end']}")
+            result = self.pre_assess_gap(
+                bam_file, gap['chrom'], gap['start'], gap['end']
+            )
+            results[gap_name] = result
+
+            if result.status == GapStatus.NEEDS_POLISH:
+                needs_polish_count += 1
+            else:
+                ready_count += 1
+
+        self.logger.info(f"Pre-assessment complete: {ready_count} ready, {needs_polish_count} need polish")
+        return results
+
     def _analyze_region(
         self,
         bam: pysam.AlignmentFile,
