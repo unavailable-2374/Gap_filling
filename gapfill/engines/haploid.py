@@ -24,7 +24,7 @@ from Bio.SeqRecord import SeqRecord
 from Bio.Seq import Seq
 
 from gapfill.core.filler import GapFiller
-from gapfill.core.validator import GapValidator
+from gapfill.core.validator import GapValidator, GapStatusTracker, GapStatus
 from gapfill.utils.hic import HiCAnalyzer, align_hic_reads
 from gapfill.utils.checkpoint import CheckpointManager, CheckpointState
 
@@ -73,6 +73,9 @@ class HaploidEngine:
         # Hi-C analyzer (initialized when needed)
         self.hic_analyzer: Optional[HiCAnalyzer] = None
         self.gap_size_estimates: Dict[str, int] = {}
+
+        # Gap status tracker (tracks UNFILLABLE, NEEDS_POLISH, etc.)
+        self.gap_tracker = GapStatusTracker()
 
         self.stats = {
             'iterations': 0,
@@ -228,11 +231,16 @@ class HaploidEngine:
             self.logger.info("Step 2: Finding gaps...")
             gaps = self._find_gaps(current_assembly)
 
+            # Use gap tracker to determine which gaps to attempt
             remaining_gaps = [g for g in gaps
-                            if g['name'] not in completely_filled_gaps
-                            and g['name'] not in failed_gaps]
+                            if self.gap_tracker.should_attempt(g['name'])]
 
             self.logger.info(f"  Remaining to process: {len(remaining_gaps)}")
+
+            # Log skip summary
+            tracker_summary = self.gap_tracker.get_summary()
+            if tracker_summary:
+                self.logger.info(f"  Status summary: {tracker_summary}")
 
             if not remaining_gaps:
                 self.logger.info("No remaining gaps, stopping")
@@ -263,29 +271,62 @@ class HaploidEngine:
 
             gap_filler.close()
 
-            # Step 4: Update assembly and checkpoint
+            # Step 4: Update assembly, checkpoint, and gap tracker
             new_completely_filled = 0
             new_partially_filled = 0
+            new_unfillable = 0
+            new_needs_polish = 0
             new_failed = 0
 
             for gap_name, data in fill_results.items():
                 result = data['result']
+                validation = result.get('validation', {})
+                validation_status = validation.get('status', '')
+
                 if result['success']:
                     if result.get('is_complete', False) and not result.get('has_placeholder', False):
                         completely_filled_gaps.add(gap_name)
                         new_completely_filled += 1
+                        self.gap_tracker.set_status(
+                            gap_name, GapStatus.FILLED_COMPLETE,
+                            validation.get('reason', 'Fill successful')
+                        )
                         # Save to checkpoint
                         self.checkpoint.add_completed_gap(gap_name, result.get('sequence', ''))
                     else:
                         partially_filled_gaps.add(gap_name)
                         new_partially_filled += 1
+                        self.gap_tracker.set_status(
+                            gap_name, GapStatus.FILLED_PARTIAL,
+                            validation.get('reason', 'Partial fill')
+                        )
                         self.checkpoint.add_partial_gap(gap_name, result.get('sequence', ''))
                 else:
+                    # Check validation status for failed gaps
+                    if validation_status == 'unfillable':
+                        new_unfillable += 1
+                        self.gap_tracker.set_status(
+                            gap_name, GapStatus.UNFILLABLE,
+                            validation.get('reason', 'No spanning reads available')
+                        )
+                    elif validation_status == 'needs_polish':
+                        new_needs_polish += 1
+                        self.gap_tracker.set_status(
+                            gap_name, GapStatus.NEEDS_POLISH,
+                            validation.get('reason', 'Flanks need polishing')
+                        )
+                    else:
+                        new_failed += 1
+                        self.gap_tracker.set_status(
+                            gap_name, GapStatus.FAILED,
+                            validation.get('reason', result.get('reason', 'Unknown failure'))
+                        )
+
                     failed_gaps.add(gap_name)
-                    new_failed += 1
                     self.checkpoint.add_failed_gap(gap_name)
 
-            self.logger.info(f"  Complete: {new_completely_filled}, Partial: {new_partially_filled}, Failed: {new_failed}")
+            self.logger.info(f"  Complete: {new_completely_filled}, Partial: {new_partially_filled}, "
+                           f"Unfillable: {new_unfillable}, NeedsPolish: {new_needs_polish}, Failed: {new_failed}")
 
             # Apply fills to assembly
             current_assembly = self._apply_fills(
@@ -312,6 +353,7 @@ class HaploidEngine:
         self.stats['gaps_completely_filled'] = len(completely_filled_gaps)
         self.stats['gaps_partially_filled'] = len(partially_filled_gaps)
         self.stats['gaps_failed'] = len(failed_gaps)
+        self.stats['gap_status_summary'] = self.gap_tracker.get_summary()
 
         # Hi-C validation of filled gaps
         if self.hic_analyzer and completely_filled_gaps:

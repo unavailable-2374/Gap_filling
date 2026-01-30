@@ -8,6 +8,7 @@ OPTIMIZATIONS:
 3. Optional HiFi polish for ONT assemblies
 4. Source tracking for quality assessment
 5. Hi-C guided candidate selection when multiple assemblies produced
+6. Integrated validation with flank analysis
 
 Strategy tiers:
   TIER 1: HiFi-only spanning (highest accuracy)
@@ -29,6 +30,7 @@ import pysam
 from Bio import SeqIO
 
 from gapfill.utils.indexer import AssemblyIndexer
+from gapfill.core.validator import GapValidator, GapStatus, ValidationResult
 
 if TYPE_CHECKING:
     from gapfill.utils.hic import HiCAnalyzer
@@ -52,6 +54,7 @@ class GapFiller:
                  min_spanning_reads: int = 3,
                  min_overlap: int = 100,
                  enable_polish: bool = True,
+                 enable_validation: bool = True,
                  hic_analyzer: Optional['HiCAnalyzer'] = None,
                  gap_size_estimates: Optional[Dict[str, int]] = None):
 
@@ -67,6 +70,7 @@ class GapFiller:
         self.min_spanning_reads = min_spanning_reads
         self.min_overlap = min_overlap
         self.enable_polish = enable_polish
+        self.enable_validation = enable_validation
         self.hic_analyzer = hic_analyzer
         self.gap_size_estimates = gap_size_estimates or {}
 
@@ -74,6 +78,9 @@ class GapFiller:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.assembly_indexer = AssemblyIndexer(assembly_file)
         self._read_sequence_cache: Dict[str, str] = {}
+
+        # Initialize validator
+        self.validator = GapValidator(threads=threads) if enable_validation else None
 
         # Check available data types
         self.has_hifi = self.hifi_bam is not None and self.hifi_bam.exists()
@@ -85,6 +92,7 @@ class GapFiller:
         self.logger.info(f"  ONT BAM: {self.ont_bam} ({'available' if self.has_ont else 'not available'})")
         self.logger.info(f"  Hi-C: {'available' if self.has_hic else 'not available'}")
         self.logger.info(f"  Polish enabled: {self.enable_polish}")
+        self.logger.info(f"  Validation enabled: {self.enable_validation}")
 
     def fill_gap(self, gap: Dict) -> Dict:
         """Fill a single gap using tiered HiFi/ONT strategy"""
@@ -118,7 +126,7 @@ class GapFiller:
                 result['source'] = 'hifi_spanning'
                 result['tier'] = 1
                 self.logger.info(f"  ✓ TIER 1 success: {len(result['sequence'])}bp (HiFi-only)")
-                return result
+                return self._finalize_result(result, gap, reads_info)
 
         # =====================================================================
         # TIER 2: ONT-only Spanning (+ optional HiFi polish)
@@ -145,7 +153,7 @@ class GapFiller:
                     result['source'] = 'ont_spanning'
                 result['tier'] = 2
                 self.logger.info(f"  ✓ TIER 2 success: {len(result['sequence'])}bp ({result['source']})")
-                return result
+                return self._finalize_result(result, gap, reads_info)
 
         # =====================================================================
         # TIER 3: Hybrid Spanning (HiFi + ONT combined)
@@ -162,7 +170,7 @@ class GapFiller:
             if result['success']:
                 result['tier'] = 3
                 self.logger.info(f"  ✓ TIER 3 success: {len(result['sequence'])}bp ({result['source']})")
-                return result
+                return self._finalize_result(result, gap, reads_info)
 
         # =====================================================================
         # TIER 4: HiFi Flanking + Merge
@@ -176,7 +184,7 @@ class GapFiller:
             if result['success']:
                 result['tier'] = 4
                 self.logger.info(f"  ✓ TIER 4 success: {len(result['sequence'])}bp ({result['source']})")
-                return result
+                return self._finalize_result(result, gap, reads_info)
 
         # =====================================================================
         # TIER 5: ONT Flanking + Merge (+ optional HiFi polish)
@@ -200,7 +208,7 @@ class GapFiller:
                             result['source'] = result['source'].replace('ont_', 'ont_hifi_polished_')
                 result['tier'] = 5
                 self.logger.info(f"  ✓ TIER 5 success: {len(result['sequence'])}bp ({result['source']})")
-                return result
+                return self._finalize_result(result, gap, reads_info)
 
         # =====================================================================
         # TIER 6: Hybrid Flanking + 500N
@@ -216,13 +224,14 @@ class GapFiller:
             if result['success']:
                 result['tier'] = 6
                 self.logger.info(f"  ✓ TIER 6 success: {len(result['sequence'])}bp ({result['source']})")
-                return result
+                return self._finalize_result(result, gap, reads_info)
 
         # =====================================================================
-        # All tiers failed
+        # All tiers failed - analyze flanks to determine if UNFILLABLE or NEEDS_POLISH
         # =====================================================================
         self.logger.warning(f"  ✗ All tiers failed for {gap_name}")
-        return {
+
+        result = {
             'success': False,
             'sequence': '',
             'strategy': None,
@@ -237,6 +246,9 @@ class GapFiller:
                 'ont_flanking': reads_info['ont_left_count'] + reads_info['ont_right_count']
             }
         }
+
+        # Analyze flanks to determine final status
+        return self._finalize_failed_result(result, gap)
 
     def _collect_reads_by_type(self, chrom: str, gap_start: int, gap_end: int) -> Dict:
         """Collect spanning and flanking reads, separated by type"""
@@ -948,6 +960,133 @@ class GapFiller:
             self.logger.debug(f"    Hi-C scoring error: {e}")
             return 0.5
 
+    def _finalize_result(self, result: Dict, gap: Dict, reads_info: Dict) -> Dict:
+        """
+        Finalize a successful fill result by adding validation info
+
+        For complete fills: validates coverage, spanning reads, junction quality
+        For partial fills: validates filled portions
+        """
+        if not self.validator:
+            return result
+
+        chrom = gap['chrom']
+        gap_start = gap['start']
+        gap_end = gap['end']
+
+        # Determine BAM file to use for validation (prefer HiFi)
+        bam_file = None
+        if self.has_hifi:
+            bam_file = str(self.hifi_bam)
+        elif self.has_ont:
+            bam_file = str(self.ont_bam)
+
+        if not bam_file:
+            return result
+
+        try:
+            if result.get('is_complete', False) and not result.get('has_placeholder', False):
+                # Complete fill - validate with full criteria
+                validation = self.validator.validate_complete_fill(
+                    bam_file, chrom, gap_start, gap_end, result['sequence']
+                )
+            else:
+                # Partial fill with placeholder - find the new gap boundaries
+                seq = result['sequence']
+                # Find N-run in sequence (the placeholder)
+                import re
+                n_match = re.search(r'N{10,}', seq)
+                if n_match:
+                    # Calculate new gap position in reference coordinates
+                    left_len = n_match.start()
+                    right_len = len(seq) - n_match.end()
+                    new_gap_start = gap_start + left_len
+                    new_gap_end = gap_end - right_len
+
+                    validation = self.validator.validate_partial_fill(
+                        bam_file, chrom, gap_start, gap_end, seq,
+                        new_gap_start, new_gap_end
+                    )
+                else:
+                    # No N-run found but marked as partial - treat as complete
+                    validation = self.validator.validate_complete_fill(
+                        bam_file, chrom, gap_start, gap_end, result['sequence']
+                    )
+
+            # Add validation info to result
+            result['validation'] = {
+                'valid': validation.valid,
+                'status': validation.status.value,
+                'confidence': validation.confidence,
+                'spanning_reads': validation.spanning_reads,
+                'avg_coverage': validation.avg_coverage,
+                'reason': validation.reason
+            }
+
+            self.logger.debug(f"    Validation: {validation.status.value} "
+                            f"(confidence={validation.confidence:.2f}, "
+                            f"spanning={validation.spanning_reads}, "
+                            f"cov={validation.avg_coverage:.1f}x)")
+
+        except Exception as e:
+            self.logger.warning(f"Validation error: {e}")
+            result['validation'] = {'valid': True, 'status': 'unknown', 'reason': str(e)}
+
+        return result
+
+    def _finalize_failed_result(self, result: Dict, gap: Dict) -> Dict:
+        """
+        Finalize a failed fill result by analyzing flanks
+
+        Determines:
+        - UNFILLABLE: flanks are correct, no spanning reads exist
+        - NEEDS_POLISH: flanks have issues (clip accumulation, high mismatches)
+        - FAILED: generic failure, may retry
+        """
+        if not self.validator:
+            return result
+
+        chrom = gap['chrom']
+        gap_start = gap['start']
+        gap_end = gap['end']
+
+        # Use HiFi BAM for flank analysis (more accurate)
+        bam_file = None
+        if self.has_hifi:
+            bam_file = str(self.hifi_bam)
+        elif self.has_ont:
+            bam_file = str(self.ont_bam)
+
+        if not bam_file:
+            return result
+
+        try:
+            analysis = self.validator.analyze_failed_gap(
+                bam_file, chrom, gap_start, gap_end
+            )
+
+            result['validation'] = {
+                'valid': False,
+                'status': analysis.status.value,
+                'reason': analysis.reason,
+                'left_flank_needs_polish': analysis.left_flank_needs_polish,
+                'right_flank_needs_polish': analysis.right_flank_needs_polish,
+                'flank_issues': analysis.flank_issues
+            }
+
+            if analysis.status == GapStatus.UNFILLABLE:
+                self.logger.info(f"    → Gap marked UNFILLABLE: {analysis.reason}")
+            elif analysis.status == GapStatus.NEEDS_POLISH:
+                self.logger.info(f"    → Gap NEEDS_POLISH: {analysis.reason}")
+
+        except Exception as e:
+            self.logger.warning(f"Flank analysis error: {e}")
+            result['validation'] = {'valid': False, 'status': 'failed', 'reason': str(e)}
+
+        return result
+
     def close(self):
         if hasattr(self, 'assembly_indexer') and self.assembly_indexer:
             self.assembly_indexer.close()
+        if hasattr(self, 'validator') and self.validator:
+            self.validator.close()

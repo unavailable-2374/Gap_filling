@@ -31,6 +31,7 @@ from Bio.SeqRecord import SeqRecord
 from Bio.Seq import Seq
 
 from gapfill.engines.haploid import HaploidEngine
+from gapfill.core.validator import GapStatusTracker, GapStatus
 from gapfill.utils.hic import HiCAnalyzer, align_hic_reads
 from gapfill.utils.checkpoint import PolyploidCheckpointManager, CheckpointState
 
