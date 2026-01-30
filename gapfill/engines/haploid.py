@@ -231,10 +231,19 @@ class HaploidEngine:
             self.logger.info("Step 2: Finding gaps...")
             gaps = self._find_gaps(current_assembly)
 
-            # Step 2b: Pre-assess gaps (only on first iteration)
+            # Step 2b: Pre-assess gaps and polish if needed (only on first iteration)
             if iteration == 1 and not self.resume:
                 self.logger.info("Step 2b: Pre-assessing gap flanks...")
-                self._pre_assess_gaps(gaps, hifi_bam, ont_bam)
+                gaps_needing_polish = self._pre_assess_gaps(gaps, hifi_bam, ont_bam)
+
+                # Step 2c: Polish flanks for gaps that need it
+                if gaps_needing_polish:
+                    self.logger.info("Step 2c: Polishing gap flanks...")
+                    current_assembly = self._polish_gap_flanks(
+                        current_assembly, gaps_needing_polish, hifi_bam, ont_bam, iter_dir
+                    )
+                    # Re-find gaps after polish (coordinates may have shifted slightly)
+                    gaps = self._find_gaps(current_assembly)
 
             # Use gap tracker to determine which gaps to attempt
             remaining_gaps = [g for g in gaps
@@ -625,14 +634,17 @@ class HaploidEngine:
         self.logger.info(f"  Partially filled: {self.stats['gaps_partially_filled']}")
         self.logger.info(f"  Failed: {self.stats['gaps_failed']}")
 
-    def _pre_assess_gaps(self, gaps: List[Dict], hifi_bam: Optional[Path], ont_bam: Optional[Path]):
+    def _pre_assess_gaps(self, gaps: List[Dict], hifi_bam: Optional[Path], ont_bam: Optional[Path]) -> List[Dict]:
         """
         Pre-assess all gaps before first filling iteration.
 
-        Analyzes flank quality for each gap and marks those needing polish.
-        This helps identify problematic gaps early and avoids wasting compute
-        on gaps that will fail due to flank issues.
+        Analyzes flank quality for each gap and identifies those needing polish.
+
+        Returns:
+            List of gap dicts that need polishing, with 'polish_left' and 'polish_right' flags
         """
+        gaps_needing_polish = []
+
         # Prefer HiFi BAM for assessment (more accurate)
         bam_file = None
         if hifi_bam and hifi_bam.exists():
@@ -642,7 +654,7 @@ class HaploidEngine:
 
         if not bam_file:
             self.logger.warning("  No BAM file available for pre-assessment, skipping")
-            return
+            return gaps_needing_polish
 
         validator = GapValidator(threads=self.threads)
 
@@ -652,17 +664,25 @@ class HaploidEngine:
             needs_polish_count = 0
             ready_count = 0
 
+            # Build gap lookup for adding polish flags
+            gap_lookup = {g.get('name', f"{g['chrom']}_{g['start']}_{g['end']}"): g for g in gaps}
+
             for gap_name, result in results.items():
                 if result.status == GapStatus.NEEDS_POLISH:
                     needs_polish_count += 1
-                    self.gap_tracker.set_status(
-                        gap_name, GapStatus.NEEDS_POLISH,
-                        result.reason
-                    )
-                    self.logger.info(f"    {gap_name}: NEEDS_POLISH - {result.reason}")
+
+                    # Create gap dict with polish flags
+                    if gap_name in gap_lookup:
+                        gap_info = gap_lookup[gap_name].copy()
+                        gap_info['polish_left'] = result.left_flank_needs_polish
+                        gap_info['polish_right'] = result.right_flank_needs_polish
+                        gaps_needing_polish.append(gap_info)
+
+                    self.logger.info(f"    {gap_name}: NEEDS_POLISH "
+                                   f"(left={result.left_flank_needs_polish}, "
+                                   f"right={result.right_flank_needs_polish})")
                 else:
                     ready_count += 1
-                    # Keep as PENDING (default), don't need to set
 
             self.logger.info(f"  Pre-assessment: {ready_count} ready, {needs_polish_count} need polish")
 
@@ -673,6 +693,84 @@ class HaploidEngine:
             self.logger.warning(f"  Pre-assessment error: {e}")
         finally:
             validator.close()
+
+        return gaps_needing_polish
+
+    def _polish_gap_flanks(self,
+                           assembly: Path,
+                           gaps_to_polish: List[Dict],
+                           hifi_bam: Optional[Path],
+                           ont_bam: Optional[Path],
+                           output_dir: Path) -> Path:
+        """
+        Polish flanks for gaps that need it.
+
+        Args:
+            assembly: Current assembly file
+            gaps_to_polish: List of gaps needing polish (with polish_left/polish_right flags)
+            hifi_bam: HiFi BAM file (preferred)
+            ont_bam: ONT BAM file (fallback)
+            output_dir: Output directory
+
+        Returns:
+            Path to polished assembly (or original if no polish performed)
+        """
+        from gapfill.core.polisher import FlankPolisher
+
+        # Prefer HiFi BAM for polishing
+        bam_file = None
+        if hifi_bam and hifi_bam.exists():
+            bam_file = str(hifi_bam)
+        elif ont_bam and ont_bam.exists():
+            bam_file = str(ont_bam)
+
+        if not bam_file:
+            self.logger.warning("  No BAM file available for polishing, skipping")
+            return assembly
+
+        polished_assembly = output_dir / "assembly_polished.fasta"
+        work_dir = output_dir / "polish_work"
+        work_dir.mkdir(exist_ok=True)
+
+        polisher = FlankPolisher(
+            threads=self.threads,
+            flank_size=1000,
+            work_dir=work_dir
+        )
+
+        try:
+            results = polisher.polish_assembly_flanks(
+                str(assembly),
+                bam_file,
+                gaps_to_polish,
+                str(polished_assembly)
+            )
+
+            # Count successful polishes
+            polished_count = sum(1 for r in results.values() if r.success)
+
+            if polished_count > 0:
+                self.logger.info(f"  Polished {polished_count}/{len(gaps_to_polish)} gap flanks")
+
+                # Reset status for polished gaps to PENDING (so they can be filled)
+                for gap_name, result in results.items():
+                    if result.success:
+                        self.gap_tracker.set_status(
+                            gap_name, GapStatus.PENDING,
+                            "Flanks polished, ready for filling"
+                        )
+
+                # Update stats
+                self.stats['gaps_polished'] = polished_count
+
+                return polished_assembly
+            else:
+                self.logger.info("  No gaps successfully polished, using original assembly")
+                return assembly
+
+        except Exception as e:
+            self.logger.warning(f"  Polishing error: {e}")
+            return assembly
 
 
 # Backwards compatibility
