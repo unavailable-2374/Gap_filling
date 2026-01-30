@@ -7,7 +7,10 @@ Gap filling tool for haploid and polyploid genome assemblies using long-read seq
 - **Multi-round iterative filling** - Progressively fills gaps across multiple iterations
 - **Haploid & Polyploid support** - Automatic mode detection based on input assemblies
 - **HiFi + ONT integration** - 6-tier strategy prioritizing HiFi accuracy with ONT length advantage
+- **Delayed validation** - Validates fills in next iteration using properly aligned reads
+- **Automatic flank polishing** - Detects and polishes problematic flanking sequences
 - **Hi-C data support** - Gap size estimation, candidate selection, and fill validation
+- **Checkpoint/resume** - Resume interrupted runs without recomputing
 - **Optimized polyploid mode** - Batch alignment reduces computation by 75%+ for polyploid genomes
 
 ## Installation
@@ -25,7 +28,7 @@ pip install biopython pysam numpy pyfaidx
 conda install -c bioconda minimap2 samtools wtdbg
 
 # Optional but recommended
-conda install -c bioconda racon        # HiFi polishing of ONT assemblies
+conda install -c bioconda racon        # Flank polishing & ONT assembly polish
 conda install -c bioconda bwa-mem2     # Hi-C alignment
 conda install -c bioconda bcftools     # Polyploid SNP calling
 conda install -c bioconda whatshap     # Alternative phasing method
@@ -52,6 +55,9 @@ python -m gapfill -a assembly.fa --hifi hifi.fq.gz --ont ont.fq.gz -o output
 
 # With Hi-C data
 python -m gapfill -a assembly.fa --hifi hifi.fq.gz --hic hic_R1.fq.gz hic_R2.fq.gz -o output
+
+# Resume interrupted run
+python -m gapfill -a assembly.fa --hifi hifi.fq.gz -o output --resume
 ```
 
 ### Polyploid genome (diploid example)
@@ -99,6 +105,10 @@ Polyploid:
   --no-ambiguous-reads      Exclude ambiguous reads in polyploid mode
   --optimized               Use batch alignment optimization (reduces alignments by 75%+)
 
+Checkpoint:
+  --resume                  Resume from checkpoint if available
+  --clear-checkpoint        Clear existing checkpoint and start fresh
+
 Other:
   -v, --verbose             Verbose output
   --version                 Show version
@@ -106,12 +116,39 @@ Other:
 
 ## How It Works
 
+### Workflow Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  PREPROCESSING PHASE (once, before iterations)                  │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Normalize gaps → 500N                                       │
+│  2. Initial alignment → BAM                                     │
+│  3. Pre-assess gap flanks                                       │
+│     ├─ OK: ready for filling                                    │
+│     └─ Issues: needs polishing                                  │
+│  4. Polish problematic flanks                                   │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  ITERATION LOOP                                                  │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Align reads → BAM                                           │
+│  2. Validate previous fills (iteration 2+)                      │
+│     ├─ Pass → FILLED_COMPLETE                                   │
+│     └─ Fail → revert to gap, retry                              │
+│  3. Find remaining gaps                                         │
+│  4. Fill gaps → mark as pending validation                      │
+│  5. Apply fills to assembly                                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
 ### Core Principles
 
 1. **N-runs are placeholders** - The length of N-runs in assemblies does not represent actual gap size
 2. **Gap normalization** - All N-runs are normalized to 500bp to ensure consistent spanning read detection
-3. **Iterative filling** - Each iteration re-aligns reads to the updated assembly
-4. **Supplementary alignment detection** - Uses supplementary alignments to find true spanning reads
+3. **Delayed validation** - Fills are validated in the next iteration using reads aligned to the filled assembly
+4. **Automatic flank polishing** - Problematic flanks (clip accumulation, high mismatches) are polished before filling
 
 ### 6-Tier Filling Strategy
 
@@ -125,6 +162,17 @@ GapFill uses a hierarchical approach prioritizing accuracy:
 | 4 | HiFi flanking + merge | Assemble flanking HiFi reads, merge contigs |
 | 5 | ONT flanking + merge | Assemble flanking ONT reads, polish with HiFi |
 | 6 | 500N placeholder | Insert placeholder if filling fails |
+
+### Gap Status Tracking
+
+| Status | Description | Next Action |
+|--------|-------------|-------------|
+| PENDING | Not yet attempted | Attempt filling |
+| NEEDS_POLISH | Flanks need polishing | Polish in preprocessing |
+| FILLED_PENDING | Filled, awaiting validation | Validate next iteration |
+| FILLED_COMPLETE | Filled and validated | Skip |
+| UNFILLABLE | Confirmed unfillable | Skip permanently |
+| FAILED | Fill/validation failed | Retry next iteration |
 
 ### Hi-C Integration
 
@@ -166,8 +214,9 @@ gapfill/
 ├── __main__.py
 ├── cli.py                        # Command-line interface
 ├── core/
-│   ├── filler.py                 # GapFiller - 6-tier HiFi/ONT strategy + Hi-C
-│   └── validator.py              # GapValidator - fill validation
+│   ├── filler.py                 # GapFiller - 6-tier HiFi/ONT strategy
+│   ├── validator.py              # GapValidator + GapStatusTracker
+│   └── polisher.py               # FlankPolisher - flank sequence polishing
 ├── engines/
 │   ├── haploid.py                # HaploidEngine - haploid mode + Hi-C
 │   ├── polyploid.py              # PolyploidEngine - standard polyploid
@@ -176,7 +225,8 @@ gapfill/
     ├── indexer.py                # AssemblyIndexer
     ├── scanner.py                # GapScanner
     ├── tempfiles.py              # TempFileManager
-    └── hic.py                    # HiCAnalyzer - Hi-C data analysis
+    ├── hic.py                    # HiCAnalyzer - Hi-C data analysis
+    └── checkpoint.py             # CheckpointManager - resume support
 ```
 
 ## Output Structure
@@ -185,12 +235,17 @@ gapfill/
 
 ```
 output/
+├── checkpoint.json              # Checkpoint for resume
+├── preprocessing/               # Preprocessing phase files
+│   ├── hifi.bam, ont.bam
+│   └── polish_work/
 ├── assembly_normalized.fasta    # Gap-normalized assembly
+├── assembly_polished.fasta      # Polished assembly (if needed)
 ├── final_assembly.fasta         # Final filled assembly
 ├── final_stats.json             # Statistics
-├── hic_aligned.bam              # Hi-C alignments (if provided)
 └── iteration_N/
     ├── assembly_filled.fasta
+    ├── assembly_reverted.fasta  # If validation failures reverted
     ├── hifi.bam, ont.bam
     └── work/gap_*/              # Per-gap working files
 ```
@@ -199,18 +254,20 @@ output/
 
 ```
 output/
+├── checkpoint.json
 ├── snp_database.json            # SNP database for phasing
 ├── phased_*_hifi.fasta          # Phased HiFi reads per haplotype
 ├── phased_*_ont.fasta           # Phased ONT reads per haplotype
 ├── hap1/final_assembly.fasta
 ├── hap2/final_assembly.fasta
-└── summary.json
+└── polyploid_summary.json
 ```
 
 ### Polyploid (Optimized)
 
 ```
 output/
+├── checkpoint.json
 ├── phase_hifi.bam, phase_ont.bam
 ├── iteration_N/
 │   ├── merged_reference.fasta   # Combined reference
@@ -232,6 +289,13 @@ output/
   "gaps_completely_filled": 120,
   "gaps_partially_filled": 20,
   "gaps_failed": 10,
+  "gaps_polished": 15,
+  "gap_status_summary": {
+    "filled_complete": 120,
+    "filled_partial": 20,
+    "unfillable": 5,
+    "failed": 5
+  },
   "total_bp_filled": 1500000,
   "hic_validated": 115,
   "hic_failed": 5
@@ -243,8 +307,29 @@ output/
 1. **Use `--optimized` for polyploid** - Significantly reduces runtime
 2. **Provide both HiFi and ONT** - Combines accuracy and length advantages
 3. **Add Hi-C data** - Improves fill quality and enables validation
-4. **Adjust `--max-iterations`** - More iterations may fill more gaps but with diminishing returns
-5. **Use SSD storage** - Alignment I/O benefits from fast storage
+4. **Use `--resume`** - Resume interrupted runs without recomputing
+5. **Adjust `--max-iterations`** - More iterations may fill more gaps but with diminishing returns
+6. **Use SSD storage** - Alignment I/O benefits from fast storage
+
+## Troubleshooting
+
+### Common Issues
+
+**Out of memory during sorting:**
+- The tool uses `-m 2G` per thread for samtools sort
+- Reduce `--threads` if memory is limited
+
+**Validation failures:**
+- Check `assembly_reverted.fasta` for gaps that failed validation
+- These gaps will be retried in subsequent iterations
+
+**Many gaps marked UNFILLABLE:**
+- These gaps have correct flanks but no spanning reads available
+- May indicate true gaps that cannot be filled with available read lengths
+
+**Resume not working:**
+- Ensure `checkpoint.json` exists in output directory
+- Use `--clear-checkpoint` to start fresh if checkpoint is corrupted
 
 ## Citation
 
