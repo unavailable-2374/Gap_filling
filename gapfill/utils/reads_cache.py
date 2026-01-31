@@ -137,18 +137,14 @@ class ReadsCache:
                     if read.is_unmapped:
                         continue
 
-                    # Skip low quality
-                    if read.mapping_quality < min_mapq:
-                        continue
-
                     # Skip if already seen (keep primary alignment info)
                     if read.query_name in seen_reads:
                         continue
                     seen_reads.add(read.query_name)
 
-                    # Check if read should be kept
-                    # Only filter out reads with high-quality alignment far from all gaps
-                    keep, reason = self._is_useful_read(read)
+                    # Check if read is anchored far from gaps
+                    # Only filter out reads that are: high-mapq + no-softclip + far from gaps
+                    keep, reason = self._is_useful_read(read, min_mapq)
 
                     if keep:
                         stats.kept_reads += 1
@@ -190,17 +186,18 @@ class ReadsCache:
 
         return output_fasta
 
-    def _is_useful_read(self, read: pysam.AlignedSegment) -> Tuple[bool, str]:
+    def _is_useful_read(self, read: pysam.AlignedSegment, min_mapq: int = 20) -> Tuple[bool, str]:
         """
         Determine if a read should be kept for gap filling.
 
-        Strategy (conservative - only filter out clearly useless reads):
-        - ONLY filter out reads that have high-quality primary alignment
-          in regions FAR from any gap
-        - Keep ALL other reads
+        Strategy: Only filter out reads that are ANCHORED far from gaps.
 
-        This is more conservative than positive filtering and avoids
-        accidentally discarding potentially useful reads.
+        "Anchored" means:
+        - High mapping quality (confident alignment)
+        - No significant soft-clips (fully aligned)
+
+        If a read is anchored AND far from all gaps → filter out
+        Otherwise → keep
 
         Returns:
             (keep, reason) where reason describes why kept/filtered
@@ -209,38 +206,72 @@ class ReadsCache:
         read_start = read.reference_start
         read_end = read.reference_end
 
-        # Keep reads with missing coordinates (can't determine position)
+        # Keep reads with missing coordinates
         if read_start is None or read_end is None:
             return True, 'no_coords'
 
-        # Keep reads on chromosomes without gaps (rare, but be safe)
+        # Filter out reads on chromosomes without gaps
         if chrom not in self.gap_intervals:
             return False, 'no_gaps'
 
-        # Check: is this read's alignment far from ALL gaps?
-        # If yes, filter it out. Otherwise, keep it.
-        min_distance_to_gap = float('inf')
+        # Check if read is "anchored" (high-quality, full alignment)
+        is_anchored = self._is_read_anchored(read, min_mapq)
 
+        # If not anchored, keep it (might be useful)
+        if not is_anchored:
+            return True, 'not_anchored'
+
+        # Read is anchored. Check if it's far from all gaps.
         for gap_start, gap_end, gap_name in self.gap_intervals[chrom]:
             # Calculate distance from read to this gap
             if read_end <= gap_start:
-                # Read is to the left of gap
                 distance = gap_start - read_end
             elif read_start >= gap_end:
-                # Read is to the right of gap
                 distance = read_start - gap_end
             else:
-                # Read overlaps with gap
-                distance = 0
+                # Read overlaps with gap - definitely keep
+                return True, 'overlaps_gap'
 
-            min_distance_to_gap = min(min_distance_to_gap, distance)
-
-            # Early exit: if read is near any gap, keep it
+            # If near any gap, keep it
             if distance <= self.GAP_PROXIMITY:
                 return True, 'near_gap'
 
-        # Read is far from all gaps → filter it out
-        return False, 'anchored'
+        # Anchored AND far from all gaps → filter out
+        return False, 'anchored_far'
+
+    def _is_read_anchored(self, read: pysam.AlignedSegment, min_mapq: int = 20) -> bool:
+        """
+        Check if a read is "anchored" - has confident, full alignment.
+
+        A read is NOT anchored if:
+        - Low mapping quality (alignment is uncertain)
+        - Has significant soft-clips (part of read didn't align)
+
+        Returns:
+            True if read is anchored (confident full alignment)
+        """
+        # Low mapq = uncertain alignment = not anchored
+        if read.mapping_quality < min_mapq:
+            return False
+
+        # Check for significant soft-clips
+        cigar = read.cigartuples
+        if not cigar:
+            return False
+
+        # Soft-clip (4) or hard-clip (5) at either end
+        CLIP_THRESHOLD = 100  # bp
+
+        # Left clip
+        if cigar[0][0] in (4, 5) and cigar[0][1] >= CLIP_THRESHOLD:
+            return False
+
+        # Right clip
+        if cigar[-1][0] in (4, 5) and cigar[-1][1] >= CLIP_THRESHOLD:
+            return False
+
+        # High quality, no significant clips = anchored
+        return True
 
     def get_filtered_reads_path(self, read_type: str) -> Optional[Path]:
         """Get path to filtered reads FASTA"""
