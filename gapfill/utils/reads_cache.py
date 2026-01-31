@@ -38,25 +38,23 @@ class GapRegion:
 class CacheStats:
     """Statistics about reads filtering"""
     total_reads: int = 0
-    anchored_reads: int = 0  # Fully anchored in non-gap regions (filtered)
-    kept_reads: int = 0  # Potentially useful reads (kept)
-    spanning_reads: int = 0  # Directly spanning a gap
-    flanking_reads: int = 0  # Adjacent to a gap
+    anchored_reads: int = 0  # Far from all gaps (filtered out)
+    kept_reads: int = 0  # Near at least one gap (kept)
 
 
 class ReadsCache:
     """
     Manages filtered reads for gap filling.
 
-    Strategy:
-    - Filter out reads that are fully anchored in non-gap regions
-    - Keep reads that may be useful for gap filling:
-      - Spanning reads (cross gap boundaries)
-      - Flanking reads (soft-clip near gap)
-      - Reads overlapping with gap regions
+    Strategy (conservative - reverse filtering):
+    - ONLY filter out reads that have high-quality alignment FAR from all gaps
+    - Keep ALL other reads
+
+    This is more conservative than positive filtering (looking for useful reads)
+    and avoids accidentally discarding potentially useful reads.
     """
 
-    # Distance threshold for considering a read "near" a gap
+    # Distance threshold: reads within this distance of a gap are kept
     GAP_PROXIMITY = 1000  # bp
 
     def __init__(self, output_dir: Path, threads: int = 8):
@@ -148,16 +146,12 @@ class ReadsCache:
                         continue
                     seen_reads.add(read.query_name)
 
-                    # Check if read is useful for gap filling
-                    is_useful, reason = self._is_useful_read(read)
+                    # Check if read should be kept
+                    # Only filter out reads with high-quality alignment far from all gaps
+                    keep, reason = self._is_useful_read(read)
 
-                    if is_useful:
+                    if keep:
                         stats.kept_reads += 1
-                        if reason == 'spanning':
-                            stats.spanning_reads += 1
-                        elif reason == 'flanking':
-                            stats.flanking_reads += 1
-
                         # Store read sequence
                         seq = read.query_sequence
                         if seq and len(seq) >= 500:
@@ -191,68 +185,61 @@ class ReadsCache:
 
         self.logger.info(f"Filtering complete: {stats.total_reads:,} total → "
                         f"{stats.kept_reads:,} kept ({100*stats.kept_reads/max(1,stats.total_reads):.1f}%)")
-        self.logger.info(f"  Spanning: {stats.spanning_reads:,}, Flanking: {stats.flanking_reads:,}, "
-                        f"Anchored (filtered): {stats.anchored_reads:,}")
+        self.logger.info(f"  Kept (near gap): {stats.kept_reads:,}, "
+                        f"Filtered (far from gaps): {stats.anchored_reads:,}")
 
         return output_fasta
 
     def _is_useful_read(self, read: pysam.AlignedSegment) -> Tuple[bool, str]:
         """
-        Determine if a read is potentially useful for gap filling.
+        Determine if a read should be kept for gap filling.
 
-        A read is useful if:
-        1. It spans a gap (starts before, ends after)
-        2. It has soft-clips near a gap boundary (potential spanning)
-        3. It overlaps with a gap region
-        4. It's near a gap boundary (within GAP_PROXIMITY)
+        Strategy (conservative - only filter out clearly useless reads):
+        - ONLY filter out reads that have high-quality primary alignment
+          in regions FAR from any gap
+        - Keep ALL other reads
 
-        A read is NOT useful (anchored) if:
-        - It's fully contained in a non-gap region with no soft-clips
-        - Both ends are far from any gap
+        This is more conservative than positive filtering and avoids
+        accidentally discarding potentially useful reads.
 
         Returns:
-            (is_useful, reason) where reason is 'spanning', 'flanking', or 'overlap'
+            (keep, reason) where reason describes why kept/filtered
         """
         chrom = read.reference_name
-        if chrom not in self.gap_intervals:
-            # Chromosome has no gaps - read is anchored
-            return False, 'no_gaps'
-
         read_start = read.reference_start
         read_end = read.reference_end
 
+        # Keep reads with missing coordinates (can't determine position)
         if read_start is None or read_end is None:
-            return False, 'no_coords'
+            return True, 'no_coords'
 
-        # Check soft-clips
-        cigar = read.cigartuples
-        has_left_clip = cigar and cigar[0][0] in (4, 5) and cigar[0][1] >= 100
-        has_right_clip = cigar and cigar[-1][0] in (4, 5) and cigar[-1][1] >= 100
+        # Keep reads on chromosomes without gaps (rare, but be safe)
+        if chrom not in self.gap_intervals:
+            return False, 'no_gaps'
 
-        # Check against each gap in this chromosome
+        # Check: is this read's alignment far from ALL gaps?
+        # If yes, filter it out. Otherwise, keep it.
+        min_distance_to_gap = float('inf')
+
         for gap_start, gap_end, gap_name in self.gap_intervals[chrom]:
-            # Case 1: Read spans the gap
-            if read_start <= gap_start and read_end >= gap_end:
-                return True, 'spanning'
+            # Calculate distance from read to this gap
+            if read_end <= gap_start:
+                # Read is to the left of gap
+                distance = gap_start - read_end
+            elif read_start >= gap_end:
+                # Read is to the right of gap
+                distance = read_start - gap_end
+            else:
+                # Read overlaps with gap
+                distance = 0
 
-            # Case 2: Read overlaps with gap region
-            if read_start < gap_end and read_end > gap_start:
-                return True, 'overlap'
+            min_distance_to_gap = min(min_distance_to_gap, distance)
 
-            # Case 3: Read ends near gap start with right soft-clip
-            if has_right_clip and abs(read_end - gap_start) <= self.GAP_PROXIMITY:
-                return True, 'flanking'
+            # Early exit: if read is near any gap, keep it
+            if distance <= self.GAP_PROXIMITY:
+                return True, 'near_gap'
 
-            # Case 4: Read starts near gap end with left soft-clip
-            if has_left_clip and abs(read_start - gap_end) <= self.GAP_PROXIMITY:
-                return True, 'flanking'
-
-            # Case 5: Read is within proximity of gap (may be useful in later iterations)
-            if (gap_start - self.GAP_PROXIMITY <= read_start <= gap_end + self.GAP_PROXIMITY or
-                gap_start - self.GAP_PROXIMITY <= read_end <= gap_end + self.GAP_PROXIMITY):
-                return True, 'proximity'
-
-        # Read is anchored in non-gap region
+        # Read is far from all gaps → filter it out
         return False, 'anchored'
 
     def get_filtered_reads_path(self, read_type: str) -> Optional[Path]:
