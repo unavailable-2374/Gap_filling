@@ -216,9 +216,11 @@ class ReadPhaser:
         Aligns each haplotype to hap1 (reference) using minimap2.
         Correctly handles different gap positions between haplotypes.
 
-        IMPORTANT: At each SNP position, we record ALL haplotype bases,
-        not just those that differ from reference. This ensures fair
-        scoring during phasing.
+        Two-pass approach:
+        1. First pass: Detect all SNP positions from all haplotype comparisons
+        2. Second pass: Re-scan alignments to fill in matching bases at SNP positions
+
+        This correctly handles coordinate differences caused by gap normalization.
         """
         snp_db = {}
 
@@ -242,11 +244,15 @@ class ReadPhaser:
         for chrom in ref_seqs:
             snp_db[chrom] = {}
 
-        # Align each other haplotype to reference
+        # Store BAM files for second pass
+        bam_files = {}
+
+        # PASS 1: Detect all SNP positions from all haplotype comparisons
+        self.logger.info("  Pass 1: Detecting SNP positions...")
         for other_hap in self.hap_names[1:]:
             other_file = self.normalized_assemblies[other_hap]
 
-            self.logger.info(f"  Aligning {other_hap} to {ref_hap}...")
+            self.logger.info(f"    Aligning {other_hap} to {ref_hap}...")
 
             other_seqs = all_hap_seqs[other_hap]
             other_gap_regions = self._build_gap_position_set(other_seqs)
@@ -254,41 +260,45 @@ class ReadPhaser:
             # Run minimap2 alignment
             bam_file = self.work_dir / f"align_{other_hap}_to_{ref_hap}.bam"
             self._align_assemblies(other_file, ref_file, bam_file)
+            bam_files[other_hap] = bam_file
 
-            # Parse alignment to find SNPs
+            # Parse alignment to find SNPs (only detect differences)
             snps_found = self._extract_snps_from_alignment(
                 bam_file, ref_seqs, other_seqs,
                 ref_gap_regions, other_gap_regions,
-                ref_hap, other_hap, snp_db
+                ref_hap, other_hap, snp_db,
+                record_matches=False  # First pass: only record differences
             )
 
-            self.logger.info(f"    Found {snps_found} SNPs between {ref_hap} and {other_hap}")
+            self.logger.info(f"      Found {snps_found} SNPs between {ref_hap} and {other_hap}")
+
+        # PASS 2: Fill in matching bases at known SNP positions
+        # This uses alignment to get correct coordinates for each haplotype
+        self.logger.info("  Pass 2: Filling all haplotype bases at SNP positions...")
+        positions_completed = 0
+
+        for other_hap in self.hap_names[1:]:
+            bam_file = bam_files.get(other_hap)
+            if not bam_file or not bam_file.exists():
+                continue
+
+            other_seqs = all_hap_seqs[other_hap]
+            other_gap_regions = self._build_gap_position_set(other_seqs)
+
+            # Re-scan alignment to fill matching bases at known SNP positions
+            filled = self._extract_snps_from_alignment(
+                bam_file, ref_seqs, other_seqs,
+                ref_gap_regions, other_gap_regions,
+                ref_hap, other_hap, snp_db,
+                record_matches=True  # Second pass: record matches at known SNP positions
+            )
+            positions_completed += filled
 
             # Clean up BAM file
             bam_file.unlink(missing_ok=True)
             Path(str(bam_file) + ".bai").unlink(missing_ok=True)
 
-        # CRITICAL: Fill in missing haplotype bases at each SNP position
-        # If hap3 has same base as hap1 at a position, it won't be recorded
-        # during alignment. We need to fill it in now.
-        self.logger.info("  Completing SNP database with all haplotype bases...")
-        positions_completed = 0
-
-        for chrom, positions in snp_db.items():
-            for ref_pos, hap_bases in positions.items():
-                # For each haplotype not in the record, add its base
-                for hap_name in self.hap_names:
-                    if hap_name not in hap_bases:
-                        # Get the base from this haplotype at this position
-                        if chrom in all_hap_seqs[hap_name]:
-                            hap_seq = all_hap_seqs[hap_name][chrom]
-                            if ref_pos < len(hap_seq):
-                                base = hap_seq[ref_pos]
-                                if base != 'N':
-                                    hap_bases[hap_name] = base
-                                    positions_completed += 1
-
-        self.logger.info(f"  Filled {positions_completed} missing haplotype entries")
+        self.logger.info(f"  Filled {positions_completed} matching haplotype entries")
 
         total_snps = sum(len(positions) for positions in snp_db.values())
         self.logger.info(f"  Total: {total_snps} haplotype-specific SNP positions")
@@ -330,12 +340,20 @@ class ReadPhaser:
                                       ref_gap_positions: Dict[str, Set[int]],
                                       query_gap_positions: Dict[str, Set[int]],
                                       ref_hap: str, query_hap: str,
-                                      snp_db: Dict) -> int:
+                                      snp_db: Dict,
+                                      record_matches: bool = False) -> int:
         """
         Extract SNPs from alignment BAM file.
         Skips positions within gap regions.
+
+        Args:
+            record_matches: If False (pass 1), only record positions where bases differ.
+                          If True (pass 2), also record matching bases at known SNP positions.
+
+        Returns:
+            Number of entries added to snp_db
         """
-        snps_found = 0
+        entries_added = 0
 
         with pysam.AlignmentFile(str(bam_file), 'rb') as bam:
             for read in bam:
@@ -373,18 +391,26 @@ class ReadPhaser:
                         if ref_base == 'N' or query_base == 'N':
                             continue
 
-                        # Found a SNP
-                        if ref_base != query_base:
-                            if ref_pos not in snp_db[ref_name]:
-                                snp_db[ref_name][ref_pos] = {ref_hap: ref_base}
-                            snp_db[ref_name][ref_pos][query_hap] = query_base
-                            snps_found += 1
+                        if not record_matches:
+                            # PASS 1: Only record positions where bases differ
+                            if ref_base != query_base:
+                                if ref_pos not in snp_db[ref_name]:
+                                    snp_db[ref_name][ref_pos] = {ref_hap: ref_base}
+                                snp_db[ref_name][ref_pos][query_hap] = query_base
+                                entries_added += 1
+                        else:
+                            # PASS 2: Record this haplotype's base at known SNP positions
+                            # This handles cases where this haplotype matches ref at a SNP position
+                            if ref_pos in snp_db[ref_name]:
+                                if query_hap not in snp_db[ref_name][ref_pos]:
+                                    snp_db[ref_name][ref_pos][query_hap] = query_base
+                                    entries_added += 1
 
                 except Exception as e:
                     self.logger.debug(f"Error processing alignment: {e}")
                     continue
 
-        return snps_found
+        return entries_added
 
     def _detect_snps_builtin(self) -> Dict:
         """
@@ -446,6 +472,15 @@ class ReadPhaser:
         # Count total SNP positions for diagnostics
         total_snp_positions = sum(len(positions) for positions in snp_db.values())
         self.logger.info(f"  Total SNP positions in database: {total_snp_positions}")
+
+        # Diagnostic: Check SNP database coverage for each haplotype
+        hap_coverage = {hap: 0 for hap in self.hap_names}
+        for chrom, positions in snp_db.items():
+            for ref_pos, hap_bases in positions.items():
+                for hap_name in hap_bases:
+                    if hap_name in hap_coverage:
+                        hap_coverage[hap_name] += 1
+        self.logger.info(f"  SNP entries per haplotype: {hap_coverage}")
 
         phased_reads = {hap: [] for hap in self.hap_names}
         ambiguous_reads = []
@@ -763,82 +798,9 @@ class PolyploidEngine:
             self.logger.info("STEP 0b: Preparing Hi-C data")
             self._prepare_hic_data(ref_assembly)
 
-        # Step 0c: Filter reads (OPTIMIZATION - keep only gap-related reads)
-        # Collect gaps from ALL haplotypes for comprehensive filtering
-        if self.optimized_mode and self.reads_cache:
-            self.logger.info("STEP 0c: Filtering reads (keeping gap-related reads only)...")
-
-            # Collect all gaps from all haplotypes
-            all_gaps = []
-            for hap_name in self.hap_names:
-                hap_gaps = phaser.gap_regions.get(hap_name, [])
-                for gap in hap_gaps:
-                    all_gaps.append({
-                        'chrom': gap.chrom,
-                        'start': gap.start,
-                        'end': gap.end,
-                        'size': gap.size,
-                        'name': gap.name
-                    })
-
-            self.logger.info(f"  Total gaps across all haplotypes: {len(all_gaps)}")
-
-            # Set gap regions for filtering (using ref_assembly coordinates)
-            # Note: After normalization, all gaps are 500bp
-            self.reads_cache.set_gap_regions(all_gaps)
-
-            # Check for existing BAM files first, then filter
-            # Priority: existing hifi_aligned.bam > preprocessing/hifi_full.bam > new alignment
-            preprocessing_dir = self.output_dir / "preprocessing"
-            preprocessing_dir.mkdir(exist_ok=True)
-
-            if self.hifi_reads and not self.reads_cache.is_cached('hifi'):
-                self.logger.info("  Filtering HiFi reads...")
-                # Check for existing BAM files
-                existing_hifi_bam = self.output_dir / "hifi_aligned.bam"
-                full_hifi_bam = preprocessing_dir / "hifi_full.bam"
-
-                if existing_hifi_bam.exists() and existing_hifi_bam.stat().st_size > 0:
-                    self.logger.info(f"    Reusing existing BAM: {existing_hifi_bam}")
-                    source_bam = existing_hifi_bam
-                elif full_hifi_bam.exists() and full_hifi_bam.stat().st_size > 0:
-                    self.logger.info(f"    Reusing existing BAM: {full_hifi_bam}")
-                    source_bam = full_hifi_bam
-                else:
-                    self.logger.info("    Aligning HiFi reads...")
-                    self._align_reads_to_ref(self.hifi_reads, ref_assembly, full_hifi_bam, 'map-hifi')
-                    source_bam = full_hifi_bam
-
-                # Filter BAM to keep only gap-related reads
-                self.reads_cache.filter_bam(source_bam, 'hifi', min_mapq=20)
-                cache_summary = self.reads_cache.get_summary()
-                self.logger.info(f"  HiFi: kept {cache_summary['hifi']['stats']['kept']:,} / "
-                               f"{cache_summary['hifi']['stats']['total']:,} reads "
-                               f"({cache_summary['hifi']['stats']['kept_ratio']*100:.1f}%)")
-
-            if self.ont_reads and not self.reads_cache.is_cached('ont'):
-                self.logger.info("  Filtering ONT reads...")
-                # Check for existing BAM files
-                existing_ont_bam = self.output_dir / "ont_aligned.bam"
-                full_ont_bam = preprocessing_dir / "ont_full.bam"
-
-                if existing_ont_bam.exists() and existing_ont_bam.stat().st_size > 0:
-                    self.logger.info(f"    Reusing existing BAM: {existing_ont_bam}")
-                    source_bam = existing_ont_bam
-                elif full_ont_bam.exists() and full_ont_bam.stat().st_size > 0:
-                    self.logger.info(f"    Reusing existing BAM: {full_ont_bam}")
-                    source_bam = full_ont_bam
-                else:
-                    self.logger.info("    Aligning ONT reads...")
-                    self._align_reads_to_ref(self.ont_reads, ref_assembly, full_ont_bam, 'map-ont')
-                    source_bam = full_ont_bam
-
-                # Filter BAM to keep only gap-related reads
-                self.reads_cache.filter_bam(source_bam, 'ont', min_mapq=20)
-                cache_summary = self.reads_cache.get_summary()
-                self.logger.info(f"  ONT: kept {cache_summary['ont']['stats']['kept']:,} / "
-                               f"{cache_summary['ont']['stats']['total']:,} reads "
-                               f"({cache_summary['ont']['stats']['kept_ratio']*100:.1f}%)")
+        # NOTE: For polyploid mode, reads filtering is done AFTER phasing, not before.
+        # Phasing requires full reads to ensure adequate SNP coverage.
+        # The HaploidEngine in STEP 3 will filter phased reads during gap filling.
 
         # Step 1: Detect haplotype-specific SNPs using alignment
         snp_db = None
@@ -882,23 +844,15 @@ class PolyploidEngine:
                             phased_ont[hap] = path
 
         if not skip_phasing:
-            # Step 2: Phase HiFi reads (if available) - align to normalized reference
+            # Step 2: Phase reads using FULL reads (not filtered)
+            # Phasing requires full coverage to accurately assign reads to haplotypes
             if self.hifi_reads:
                 self.logger.info("STEP 2a: Aligning and phasing HiFi reads")
 
                 hifi_bam = self.output_dir / "hifi_aligned.bam"
-                # Check if BAM exists
+                # Check if BAM exists (use full reads for phasing)
                 if not (self.resume and hifi_bam.exists() and hifi_bam.stat().st_size > 0):
-                    # Use filtered reads if available (optimized mode)
-                    if self.optimized_mode and self.reads_cache:
-                        filtered_hifi = self.reads_cache.get_filtered_reads_path('hifi')
-                        if filtered_hifi and filtered_hifi.exists():
-                            self.logger.info("  Using filtered HiFi reads for phasing...")
-                            self._align_reads_to_ref(filtered_hifi, ref_assembly, hifi_bam, 'map-hifi')
-                        else:
-                            self._align_reads_to_ref(self.hifi_reads, ref_assembly, hifi_bam, 'map-hifi')
-                    else:
-                        self._align_reads_to_ref(self.hifi_reads, ref_assembly, hifi_bam, 'map-hifi')
+                    self._align_reads_to_ref(self.hifi_reads, ref_assembly, hifi_bam, 'map-hifi')
                 else:
                     self.logger.info(f"  Reusing existing BAM: {hifi_bam}")
 
@@ -913,18 +867,9 @@ class PolyploidEngine:
                 self.logger.info("STEP 2b: Aligning and phasing ONT reads")
 
                 ont_bam = self.output_dir / "ont_aligned.bam"
-                # Check if BAM exists
+                # Check if BAM exists (use full reads for phasing)
                 if not (self.resume and ont_bam.exists() and ont_bam.stat().st_size > 0):
-                    # Use filtered reads if available (optimized mode)
-                    if self.optimized_mode and self.reads_cache:
-                        filtered_ont = self.reads_cache.get_filtered_reads_path('ont')
-                        if filtered_ont and filtered_ont.exists():
-                            self.logger.info("  Using filtered ONT reads for phasing...")
-                            self._align_reads_to_ref(filtered_ont, ref_assembly, ont_bam, 'map-ont')
-                        else:
-                            self._align_reads_to_ref(self.ont_reads, ref_assembly, ont_bam, 'map-ont')
-                    else:
-                        self._align_reads_to_ref(self.ont_reads, ref_assembly, ont_bam, 'map-ont')
+                    self._align_reads_to_ref(self.ont_reads, ref_assembly, ont_bam, 'map-ont')
                 else:
                     self.logger.info(f"  Reusing existing BAM: {ont_bam}")
 
@@ -1283,10 +1228,10 @@ class PolyploidEngine:
         self.logger.info(f"    Hi-C BAM: {hic_bam}")
         self.logger.info(f"    Skip normalization: {skip_normalization}")
 
-        # Note: Disable reads filtering in HaploidEngine because:
-        # 1. Reads are already filtered at polyploid STEP 0c
-        # 2. Phased reads are already a subset of gap-related reads
-        # But keep parallel filling enabled for speedup
+        # Enable reads filtering in HaploidEngine:
+        # - Phased reads are full reads assigned to this haplotype
+        # - HaploidEngine will filter to keep only gap-related reads
+        # - This reduces alignment time in subsequent iterations
         engine = HaploidEngine(
             assembly_file=str(assembly),
             hifi_reads=str(hifi_reads) if hifi_reads else None,
@@ -1296,8 +1241,8 @@ class PolyploidEngine:
             threads=self.threads,
             max_iterations=self.max_iterations,
             skip_normalization=skip_normalization,
-            optimized_mode=False,  # Reads already filtered at polyploid level
-            parallel_filling=True   # Keep parallel gap filling
+            optimized_mode=self.optimized_mode,  # Filter phased reads
+            parallel_filling=True  # Parallel gap filling
         )
 
         return engine.run()
