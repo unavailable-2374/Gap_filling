@@ -130,17 +130,22 @@ class ReadsCache:
 
         try:
             with pysam.AlignmentFile(str(bam_file), 'rb') as bam:
-                for read in bam.fetch():
+                # Use until_eof=True to include unmapped reads
+                for read in bam.fetch(until_eof=True):
                     stats.total_reads += 1
-
-                    # Skip unmapped, secondary, supplementary
-                    if read.is_unmapped:
-                        continue
 
                     # Skip if already seen (keep primary alignment info)
                     if read.query_name in seen_reads:
                         continue
                     seen_reads.add(read.query_name)
+
+                    # Unmapped reads are kept (not anchored anywhere)
+                    if read.is_unmapped:
+                        stats.kept_reads += 1
+                        seq = read.query_sequence
+                        if seq and len(seq) >= 500:
+                            kept_reads[read.query_name] = seq
+                        continue
 
                     # Check if read is anchored far from gaps
                     # Only filter out reads that are: high-mapq + no-softclip + far from gaps
