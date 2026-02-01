@@ -464,10 +464,23 @@ class ReadPhaser:
         return self._detect_snps_alignment()
 
     def phase_reads_from_bam(self, bam_file: Path, snp_db: Dict,
-                             output_prefix: Path, read_type: str = 'reads') -> Dict[str, Path]:
-        """Phase reads based on SNP profiles"""
+                             output_prefix: Path, read_type: str = 'reads',
+                             filtered_read_names: Optional[Set[str]] = None) -> Dict[str, Path]:
+        """
+        Phase reads based on SNP profiles.
+
+        Args:
+            bam_file: BAM file with aligned reads
+            snp_db: SNP database
+            output_prefix: Output path prefix
+            read_type: 'hifi' or 'ont'
+            filtered_read_names: If provided, only output reads in this set
+                                (but still use all reads for phasing decisions)
+        """
         self.logger.info(f"Phasing {read_type} reads to haplotypes...")
         self.logger.info(f"  min_read_snps threshold: {self.min_read_snps}")
+        if filtered_read_names:
+            self.logger.info(f"  Will output only {len(filtered_read_names):,} filtered reads")
 
         # Count total SNP positions for diagnostics
         total_snp_positions = sum(len(positions) for positions in snp_db.values())
@@ -491,7 +504,8 @@ class ReadPhaser:
             'ambiguous': 0,
             'no_snp_overlap': 0,  # Reads that don't overlap any SNP
             'tie_scores': 0,      # Reads with tied scores
-            'below_threshold': 0  # Reads below min_read_snps
+            'below_threshold': 0,  # Reads below min_read_snps
+            'filtered_out': 0     # Reads not in filtered set
         }
 
         try:
@@ -504,12 +518,23 @@ class ReadPhaser:
 
                     hap_assignment, reason = self._assign_read_to_haplotype_detailed(read, snp_db)
 
+                    # Check if read passes filter (if filtering enabled)
+                    passes_filter = (filtered_read_names is None or
+                                    read.query_name in filtered_read_names)
+
                     if hap_assignment:
-                        phased_reads[hap_assignment].append(read)
-                        stats['phased'][hap_assignment] += 1
+                        if passes_filter:
+                            phased_reads[hap_assignment].append(read)
+                            stats['phased'][hap_assignment] += 1
+                        else:
+                            stats['filtered_out'] += 1
                     else:
-                        ambiguous_reads.append(read)
-                        stats['ambiguous'] += 1
+                        if passes_filter:
+                            ambiguous_reads.append(read)
+                            stats['ambiguous'] += 1
+                        else:
+                            stats['filtered_out'] += 1
+
                         if reason == 'no_snp':
                             stats['no_snp_overlap'] += 1
                         elif reason == 'tie':
@@ -552,8 +577,10 @@ class ReadPhaser:
         phased_total = sum(stats['phased'].values())
         self.logger.info(f"  --- Phasing Summary ---")
         self.logger.info(f"  Total reads: {total}")
-        self.logger.info(f"  Phased: {phased_total} ({phased_total/total*100:.1f}%)" if total > 0 else "  Phased: 0")
-        self.logger.info(f"  Ambiguous: {stats['ambiguous']} ({stats['ambiguous']/total*100:.1f}%)" if total > 0 else "  Ambiguous: 0")
+        self.logger.info(f"  Phased (output): {phased_total} ({phased_total/total*100:.1f}%)" if total > 0 else "  Phased: 0")
+        self.logger.info(f"  Ambiguous (output): {stats['ambiguous']} ({stats['ambiguous']/total*100:.1f}%)" if total > 0 else "  Ambiguous: 0")
+        if stats['filtered_out'] > 0:
+            self.logger.info(f"  Filtered out (far from gaps): {stats['filtered_out']}")
         self.logger.info(f"    - No SNP overlap: {stats['no_snp_overlap']}")
         self.logger.info(f"    - Below threshold ({self.min_read_snps}): {stats['below_threshold']}")
         self.logger.info(f"    - Tied scores: {stats['tie_scores']}")
@@ -644,6 +671,7 @@ class PolyploidEngine:
                  phasing_method: str = 'builtin',
                  use_ambiguous_reads: bool = True,
                  min_gap_size: int = 100,
+                 min_mapq: int = 20,
                  min_read_snps: int = 1,
                  resume: bool = False,
                  clear_checkpoint: bool = False,
@@ -661,6 +689,7 @@ class PolyploidEngine:
         self.phasing_method = phasing_method
         self.use_ambiguous_reads = use_ambiguous_reads
         self.min_gap_size = min_gap_size
+        self.min_mapq = min_mapq
         self.min_read_snps = min_read_snps
         self.resume = resume
         self.optimized_mode = optimized_mode
@@ -844,39 +873,71 @@ class PolyploidEngine:
                             phased_ont[hap] = path
 
         if not skip_phasing:
-            # Step 2: Phase reads using FULL reads (not filtered)
-            # Phasing requires full coverage to accurately assign reads to haplotypes
+            # Collect gap regions for filtering
+            gap_regions_for_filter = {}
+            for hap_name in self.hap_names:
+                gaps = phaser.gap_regions.get(hap_name, [])
+                gap_regions_for_filter[hap_name] = [
+                    {'chrom': g.chrom, 'start': g.start, 'end': g.end}
+                    for g in gaps
+                ]
+
+            # Step 2a: Align HiFi reads
+            hifi_bam = None
+            filtered_hifi_names = None
             if self.hifi_reads:
-                self.logger.info("STEP 2a: Aligning and phasing HiFi reads")
+                self.logger.info("STEP 2a: Aligning HiFi reads")
 
                 hifi_bam = self.output_dir / "hifi_aligned.bam"
-                # Check if BAM exists (use full reads for phasing)
                 if not (self.resume and hifi_bam.exists() and hifi_bam.stat().st_size > 0):
                     self._align_reads_to_ref(self.hifi_reads, ref_assembly, hifi_bam, 'map-hifi')
                 else:
                     self.logger.info(f"  Reusing existing BAM: {hifi_bam}")
 
-                phased_hifi = phaser.phase_reads_from_bam(
-                    hifi_bam, snp_db,
-                    self.output_dir / "phased",
-                    read_type='hifi'
-                )
+                # Filter reads based on gaps (only if optimized mode)
+                if self.optimized_mode:
+                    self.logger.info("  Filtering HiFi reads based on gap proximity...")
+                    filtered_hifi_names = self._filter_reads_by_gaps(
+                        hifi_bam, gap_regions_for_filter, self.min_mapq
+                    )
 
-            # Step 2b: Phase ONT reads (if available)
+            # Step 2b: Align ONT reads
+            ont_bam = None
+            filtered_ont_names = None
             if self.ont_reads:
-                self.logger.info("STEP 2b: Aligning and phasing ONT reads")
+                self.logger.info("STEP 2b: Aligning ONT reads")
 
                 ont_bam = self.output_dir / "ont_aligned.bam"
-                # Check if BAM exists (use full reads for phasing)
                 if not (self.resume and ont_bam.exists() and ont_bam.stat().st_size > 0):
                     self._align_reads_to_ref(self.ont_reads, ref_assembly, ont_bam, 'map-ont')
                 else:
                     self.logger.info(f"  Reusing existing BAM: {ont_bam}")
 
+                # Filter reads based on gaps (only if optimized mode)
+                if self.optimized_mode:
+                    self.logger.info("  Filtering ONT reads based on gap proximity...")
+                    filtered_ont_names = self._filter_reads_by_gaps(
+                        ont_bam, gap_regions_for_filter, self.min_mapq
+                    )
+
+            # Step 2c: Phase HiFi reads
+            if hifi_bam:
+                self.logger.info("STEP 2c: Phasing HiFi reads")
+                phased_hifi = phaser.phase_reads_from_bam(
+                    hifi_bam, snp_db,
+                    self.output_dir / "phased",
+                    read_type='hifi',
+                    filtered_read_names=filtered_hifi_names  # Only output filtered reads
+                )
+
+            # Step 2d: Phase ONT reads
+            if ont_bam:
+                self.logger.info("STEP 2d: Phasing ONT reads")
                 phased_ont = phaser.phase_reads_from_bam(
                     ont_bam, snp_db,
                     self.output_dir / "phased",
-                    read_type='ont'
+                    read_type='ont',
+                    filtered_read_names=filtered_ont_names  # Only output filtered reads
                 )
 
             # Save phased reads to checkpoint
@@ -1198,6 +1259,123 @@ class PolyploidEngine:
         with open(output_file, 'w') as f:
             json.dump(serializable, f, indent=2)
 
+    def _filter_reads_by_gaps(self, bam_file: Path, gap_regions: Dict[str, List],
+                               min_mapq: int = 20, gap_proximity: int = 1000) -> Set[str]:
+        """
+        Filter reads based on proximity to gaps from ALL haplotypes.
+
+        Only filter out reads that are:
+        1. Anchored (high mapq, no significant soft-clips)
+        2. Far from ALL gaps across all haplotypes
+
+        Args:
+            bam_file: BAM file with aligned reads
+            gap_regions: Dict mapping hap_name -> list of gap dicts
+            min_mapq: Minimum mapping quality for "anchored" reads
+            gap_proximity: Distance threshold for "near gap"
+
+        Returns:
+            Set of read names that should be kept
+        """
+        # Collect all gap intervals from all haplotypes
+        # Use reference (hap1) coordinates since reads are aligned to hap1
+        all_gap_intervals: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+
+        # Only use hap1's gaps since reads are aligned to hap1
+        ref_hap = self.hap_names[0]
+        if ref_hap in gap_regions:
+            for gap in gap_regions[ref_hap]:
+                chrom = gap['chrom']
+                all_gap_intervals[chrom].append((gap['start'], gap['end']))
+
+        # Sort intervals for each chromosome
+        for chrom in all_gap_intervals:
+            all_gap_intervals[chrom].sort()
+
+        self.logger.info(f"  Filtering based on {sum(len(v) for v in all_gap_intervals.values())} gap regions")
+
+        kept_reads = set()
+        stats = {'total': 0, 'kept': 0, 'filtered': 0}
+
+        with pysam.AlignmentFile(str(bam_file), 'rb') as bam:
+            for read in bam.fetch(until_eof=True):
+                if read.is_secondary:
+                    continue
+
+                stats['total'] += 1
+
+                # Unmapped reads: keep (not anchored)
+                if read.is_unmapped:
+                    kept_reads.add(read.query_name)
+                    stats['kept'] += 1
+                    continue
+
+                # Check if read is anchored (high mapq + no significant clips)
+                is_anchored = self._is_read_anchored(read, min_mapq)
+
+                if not is_anchored:
+                    # Not anchored: keep
+                    kept_reads.add(read.query_name)
+                    stats['kept'] += 1
+                    continue
+
+                # Anchored read: check if near any gap
+                chrom = read.reference_name
+                read_start = read.reference_start
+                read_end = read.reference_end
+
+                if read_start is None or read_end is None:
+                    kept_reads.add(read.query_name)
+                    stats['kept'] += 1
+                    continue
+
+                # Check distance to gaps
+                near_gap = False
+                if chrom in all_gap_intervals:
+                    for gap_start, gap_end in all_gap_intervals[chrom]:
+                        # Calculate distance
+                        if read_end <= gap_start:
+                            distance = gap_start - read_end
+                        elif read_start >= gap_end:
+                            distance = read_start - gap_end
+                        else:
+                            distance = 0  # Overlaps
+
+                        if distance <= gap_proximity:
+                            near_gap = True
+                            break
+
+                if near_gap:
+                    kept_reads.add(read.query_name)
+                    stats['kept'] += 1
+                else:
+                    stats['filtered'] += 1
+
+        self.logger.info(f"  Reads filtering: {stats['total']:,} total → "
+                        f"{stats['kept']:,} kept ({100*stats['kept']/max(1,stats['total']):.1f}%), "
+                        f"{stats['filtered']:,} filtered")
+
+        return kept_reads
+
+    def _is_read_anchored(self, read: pysam.AlignedSegment, min_mapq: int = 20) -> bool:
+        """Check if a read is anchored (high mapq + no significant soft-clips)"""
+        if read.mapping_quality < min_mapq:
+            return False
+
+        cigar = read.cigartuples
+        if not cigar:
+            return False
+
+        CLIP_THRESHOLD = 100
+
+        # Check for significant clips
+        if cigar[0][0] in (4, 5) and cigar[0][1] >= CLIP_THRESHOLD:
+            return False
+        if cigar[-1][0] in (4, 5) and cigar[-1][1] >= CLIP_THRESHOLD:
+            return False
+
+        return True
+
     def _combine_fasta_files(self, input_files: List[Path], output_file: Path):
         """Combine multiple FASTA files"""
         with open(output_file, 'w') as out:
@@ -1228,10 +1406,10 @@ class PolyploidEngine:
         self.logger.info(f"    Hi-C BAM: {hic_bam}")
         self.logger.info(f"    Skip normalization: {skip_normalization}")
 
-        # Enable reads filtering in HaploidEngine:
-        # - Phased reads are full reads assigned to this haplotype
-        # - HaploidEngine will filter to keep only gap-related reads
-        # - This reduces alignment time in subsequent iterations
+        # Disable reads filtering in HaploidEngine because:
+        # - Reads are already filtered at polyploid STEP 2 (based on BAM alignment)
+        # - No need to filter again, saves time
+        # - Keep parallel filling enabled for speedup
         engine = HaploidEngine(
             assembly_file=str(assembly),
             hifi_reads=str(hifi_reads) if hifi_reads else None,
@@ -1241,7 +1419,7 @@ class PolyploidEngine:
             threads=self.threads,
             max_iterations=self.max_iterations,
             skip_normalization=skip_normalization,
-            optimized_mode=self.optimized_mode,  # Filter phased reads
+            optimized_mode=False,  # Already filtered at polyploid level
             parallel_filling=True  # Parallel gap filling
         )
 
