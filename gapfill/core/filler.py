@@ -608,6 +608,16 @@ class GapFiller:
         if not left_seq and not right_seq:
             return {'success': False, 'reason': f'Flanking assembly failed for {read_type}'}
 
+        # Trim flank overlap from assembled sequences
+        # This removes the portion that duplicates the existing flank region
+        if gap_info and (left_seq or right_seq):
+            left_seq, right_seq = self._trim_flank_overlap(
+                left_seq, right_seq, gap_info, work_dir
+            )
+
+        if not left_seq and not right_seq:
+            return {'success': False, 'reason': f'No gap-extending sequence after trimming'}
+
         # Try to merge
         if left_seq and right_seq:
             merged_seq = self._try_merge_sequences(left_seq, right_seq, work_dir)
@@ -639,6 +649,207 @@ class GapFiller:
             'is_complete': False,
             'has_placeholder': True
         }
+
+    def _trim_flank_overlap(self, left_seq: str, right_seq: str,
+                             gap_info: Dict, work_dir: Path) -> Tuple[str, str]:
+        """
+        Remove flank overlap from assembled sequences.
+
+        The assembled sequences may contain portions that overlap with the
+        existing flank regions. This method aligns the assembled sequences
+        to the flanks and trims the overlapping portions.
+
+        Args:
+            left_seq: Assembled sequence from left flanking reads
+            right_seq: Assembled sequence from right flanking reads
+            gap_info: Gap information dict with 'chrom', 'start', 'end'
+            work_dir: Working directory for temporary files
+
+        Returns:
+            Tuple of (trimmed_left_seq, trimmed_right_seq)
+        """
+        chrom = gap_info['chrom']
+        gap_start = gap_info['start']
+        gap_end = gap_info['end']
+
+        # Get flank sequences from assembly
+        flank_size = 2000  # Check 2kb of flank for overlap
+        left_flank = self.assembly_indexer.get_sequence(
+            chrom, max(0, gap_start - flank_size), gap_start
+        )
+        right_flank = self.assembly_indexer.get_sequence(
+            chrom, gap_end, gap_end + flank_size
+        )
+
+        trimmed_left = left_seq
+        trimmed_right = right_seq
+
+        # Trim left_seq: remove the part that overlaps with left flank
+        if left_seq and left_flank:
+            trimmed_left = self._trim_left_overlap(left_seq, left_flank, work_dir)
+
+        # Trim right_seq: remove the part that overlaps with right flank
+        if right_seq and right_flank:
+            trimmed_right = self._trim_right_overlap(right_seq, right_flank, work_dir)
+
+        return trimmed_left, trimmed_right
+
+    def _trim_left_overlap(self, assembled_seq: str, flank_seq: str,
+                           work_dir: Path) -> str:
+        """
+        Trim the portion of assembled_seq that overlaps with left flank.
+
+        For left side assembly, the overlap is at the START of assembled_seq.
+        We want to keep only the part that extends INTO the gap.
+
+        Example:
+            flank_seq:     ...ACGTACGT (ends at gap_start)
+            assembled_seq: ACGTACGT XXXXXXX (starts with flank, extends into gap)
+                          |overlap| |keep |
+            result:                 XXXXXXX
+        """
+        if len(assembled_seq) < 100 or len(flank_seq) < 100:
+            return assembled_seq
+
+        try:
+            # Write sequences to files
+            assembled_fa = work_dir / "trim_left_assembled.fa"
+            flank_fa = work_dir / "trim_left_flank.fa"
+
+            with open(assembled_fa, 'w') as f:
+                f.write(f">assembled\n{assembled_seq}\n")
+            with open(flank_fa, 'w') as f:
+                f.write(f">flank\n{flank_seq}\n")
+
+            # Align assembled to flank
+            result = subprocess.run(
+                ['minimap2', '-x', 'asm5', '-c', str(flank_fa), str(assembled_fa)],
+                capture_output=True, text=True, timeout=60
+            )
+
+            if result.returncode != 0 or not result.stdout.strip():
+                return assembled_seq
+
+            # Parse PAF output to find overlap
+            # PAF format: query_name, query_len, query_start, query_end, strand,
+            #             target_name, target_len, target_start, target_end, ...
+            best_query_end = 0
+
+            for line in result.stdout.strip().split('\n'):
+                fields = line.split('\t')
+                if len(fields) < 12:
+                    continue
+
+                query_start = int(fields[2])  # assembled_seq start
+                query_end = int(fields[3])    # assembled_seq end
+                strand = fields[4]
+                target_end = int(fields[8])   # flank end
+                target_len = int(fields[6])   # flank length
+                matches = int(fields[9])
+                block_len = int(fields[10])
+
+                identity = matches / block_len if block_len > 0 else 0
+
+                # We want alignments where:
+                # 1. The flank alignment reaches near the end of flank (near gap_start)
+                # 2. The assembled_seq alignment starts near the beginning
+                # 3. Good identity
+                if (identity >= 0.9 and
+                    target_end >= target_len - 100 and  # Flank alignment near gap
+                    query_start < 200 and               # Assembled starts from beginning
+                    strand == '+'):
+                    if query_end > best_query_end:
+                        best_query_end = query_end
+
+            if best_query_end > 0 and best_query_end < len(assembled_seq) - 100:
+                # Trim the overlapping portion
+                trimmed = assembled_seq[best_query_end:]
+                self.logger.debug(f"    Trimmed left overlap: {len(assembled_seq)}bp -> {len(trimmed)}bp")
+                return trimmed
+
+            return assembled_seq
+
+        except Exception as e:
+            self.logger.debug(f"    Left trim error: {e}")
+            return assembled_seq
+
+    def _trim_right_overlap(self, assembled_seq: str, flank_seq: str,
+                            work_dir: Path) -> str:
+        """
+        Trim the portion of assembled_seq that overlaps with right flank.
+
+        For right side assembly, the overlap is at the END of assembled_seq.
+        We want to keep only the part that extends INTO the gap.
+
+        Example:
+            assembled_seq: XXXXXXX GCTAGCTA (ends with flank, starts in gap)
+                          | keep | |overlap|
+            flank_seq:             GCTAGCTA... (starts at gap_end)
+            result:        XXXXXXX
+        """
+        if len(assembled_seq) < 100 or len(flank_seq) < 100:
+            return assembled_seq
+
+        try:
+            # Write sequences to files
+            assembled_fa = work_dir / "trim_right_assembled.fa"
+            flank_fa = work_dir / "trim_right_flank.fa"
+
+            with open(assembled_fa, 'w') as f:
+                f.write(f">assembled\n{assembled_seq}\n")
+            with open(flank_fa, 'w') as f:
+                f.write(f">flank\n{flank_seq}\n")
+
+            # Align assembled to flank
+            result = subprocess.run(
+                ['minimap2', '-x', 'asm5', '-c', str(flank_fa), str(assembled_fa)],
+                capture_output=True, text=True, timeout=60
+            )
+
+            if result.returncode != 0 or not result.stdout.strip():
+                return assembled_seq
+
+            # Parse PAF output to find overlap
+            best_query_start = len(assembled_seq)
+            assembled_len = len(assembled_seq)
+
+            for line in result.stdout.strip().split('\n'):
+                fields = line.split('\t')
+                if len(fields) < 12:
+                    continue
+
+                query_start = int(fields[2])  # assembled_seq start
+                query_end = int(fields[3])    # assembled_seq end
+                query_len = int(fields[1])    # assembled_seq length
+                strand = fields[4]
+                target_start = int(fields[7]) # flank start
+                matches = int(fields[9])
+                block_len = int(fields[10])
+
+                identity = matches / block_len if block_len > 0 else 0
+
+                # We want alignments where:
+                # 1. The flank alignment starts near the beginning of flank (near gap_end)
+                # 2. The assembled_seq alignment ends near the end
+                # 3. Good identity
+                if (identity >= 0.9 and
+                    target_start < 100 and              # Flank alignment near gap
+                    query_end > query_len - 200 and     # Assembled ends near end
+                    strand == '+'):
+                    if query_start < best_query_start:
+                        best_query_start = query_start
+
+            if best_query_start > 100 and best_query_start < assembled_len:
+                # Trim the overlapping portion
+                trimmed = assembled_seq[:best_query_start]
+                self.logger.debug(f"    Trimmed right overlap: {len(assembled_seq)}bp -> {len(trimmed)}bp")
+                return trimmed
+
+            return assembled_seq
+
+        except Exception as e:
+            self.logger.debug(f"    Right trim error: {e}")
+            return assembled_seq
 
     def _try_merge_sequences(self, left_seq: str, right_seq: str, work_dir: Path) -> Optional[str]:
         """Attempt to merge left and right sequences by finding overlap"""
@@ -1016,11 +1227,11 @@ class GapFiller:
                 import re
                 n_match = re.search(r'N{10,}', seq)
                 if n_match:
-                    # Calculate new gap position in reference coordinates
-                    left_len = n_match.start()
-                    right_len = len(seq) - n_match.end()
-                    new_gap_start = gap_start + left_len
-                    new_gap_end = gap_end - right_len
+                    # Calculate new gap position in filled assembly coordinates
+                    # After filling, the sequence [gap_start:gap_end] is replaced by 'seq'
+                    # The new 500N placeholder is at [gap_start + n_match.start(), gap_start + n_match.end()]
+                    new_gap_start = gap_start + n_match.start()
+                    new_gap_end = gap_start + n_match.end()
 
                     validation = self.validator.validate_partial_fill(
                         bam_file, chrom, gap_start, gap_end, seq,
