@@ -147,14 +147,20 @@ Other:
 ├─────────────────────────────────────────────────────────────────┤
 │  1. Align reads → BAM (use filtered reads if enabled)           │
 │  2. Validate previous fills (iteration 2+)                      │
-│     ├─ Pass → FILLED_COMPLETE                                   │
-│     └─ Fail → revert to gap, retry                              │
-│  3. Find remaining gaps                                         │
+│     ├─ Complete fill: check spanning reads                      │
+│     │   ├─ Pass → FILLED_COMPLETE                               │
+│     │   └─ Fail → revert to 500N gap                            │
+│     ├─ Partial fill: independent left/right validation          │
+│     │   ├─ Both pass → FILLED_PARTIAL                           │
+│     │   ├─ One pass → keep passed side, revert failed side      │
+│     │   └─ Both fail → revert to 500N gap                       │
+│     └─ 2b. Re-align reads if any reverts occurred               │
+│  3. Find remaining gaps (using reverted assembly coordinates)   │
 │  4. [OPT] Fill gaps in parallel                                 │
 │     ├─ Tier 0: consensus-first (skip wtdbg2)                    │
 │     ├─ High-confidence → immediate validation                   │
 │     └─ Others → pending validation                              │
-│  5. Apply fills to assembly                                     │
+│  5. Apply fills to assembly (update downstream coordinates)     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -191,9 +197,28 @@ GapFill uses a hierarchical approach prioritizing accuracy:
 | PENDING | Not yet attempted | Attempt filling |
 | NEEDS_POLISH | Flanks need polishing | Polish in preprocessing |
 | FILLED_PENDING | Filled, awaiting validation | Validate next iteration |
-| FILLED_COMPLETE | Filled and validated | Skip |
+| FILLED_COMPLETE | Completely filled and validated | Skip |
+| FILLED_PARTIAL | Partially filled and validated | Skip |
 | UNFILLABLE | Confirmed unfillable | Skip permanently |
 | FAILED | Fill/validation failed | Retry next iteration |
+
+### Validation Logic
+
+**Complete fills** (spanning reads assembled):
+- Require spanning reads covering the entire fill
+- Short gaps (< 5kb): ≥3 spanning reads
+- Long gaps (≥ 5kb): ≥5 spanning reads
+- Fail → revert entire fill to 500N gap
+
+**Partial fills** (flanking assembly with 500N placeholder):
+- Independent left/right validation
+- Check junction coverage (≥5x at connection points)
+- Check insert coverage (≥5x average, no breakpoints)
+- Left/right validated independently → keep passed side, revert failed side
+- Both sides fail → revert to single 500N gap
+
+**Re-alignment after revert:**
+When validation fails and fills are reverted, reads are re-aligned to the reverted assembly before the next filling attempt. This ensures gap coordinates are accurate.
 
 ### Hi-C Integration
 

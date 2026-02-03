@@ -202,16 +202,20 @@ gapfill/
 ├─────────────────────────────────────────────────────────────────┤
 │  1. [优化] Align FILTERED reads → BAM (而非全量reads)           │
 │  2. Validate previous fills (iteration 2+)                      │
-│      ├─ 验证通过 → FILLED_COMPLETE/PARTIAL                      │
-│      └─ 验证失败 → 回退填充，恢复 500N gap                       │
-│  3. Find remaining gaps                                         │
+│      ├─ 完全填充验证：检查 spanning reads                       │
+│      ├─ 部分填充验证：独立判断左右两侧                          │
+│      │   ├─ 左侧通过 + 右侧失败 → 保留左侧，右侧回退 500N       │
+│      │   ├─ 左侧失败 + 右侧通过 → 左侧回退 500N，保留右侧       │
+│      │   └─ 两侧都失败 → 完全回退为 500N gap                    │
+│      └─ 2b. 如有回退 → 重新比对 reads 到 reverted assembly      │
+│  3. Find remaining gaps (基于 reverted assembly 坐标)           │
 │  4. [优化] Fill gaps in PARALLEL                                │
 │      ├─ TIER 0: 共识优先 (跳过wtdbg2)                           │
 │      └─ TIER 1-6: 常规策略                                      │
 │  5. Process results:                                            │
-│      ├─ 高置信度 → FILLED_COMPLETE (立即确认)                   │
+│      ├─ 高置信度完全填充 → FILLED_COMPLETE (立即确认)           │
 │      └─ 其他 → FILLED_PENDING (延迟验证)                        │
-│  6. Apply fills to assembly                                     │
+│  6. Apply fills to assembly (更新后续填充坐标)                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -239,15 +243,28 @@ gapfill/
        │
 预处理 ├──→ NEEDS_POLISH ──→ [Polish] ──→ PENDING
        │
-迭代 N ├──→ 填充成功 ──→ FILLED_PENDING
-       │                      │
-       │              迭代 N+1 验证
-       │                      │
-       │              ├─ 通过 → FILLED_COMPLETE
-       │              └─ 失败 → FAILED (回退 gap)
+迭代 N ├──→ 完全填充成功 ──→ FILLED_PENDING ──→ 迭代 N+1 验证
+       │                                            │
+       │                                    ├─ spanning reads 足够 → FILLED_COMPLETE
+       │                                    └─ 验证失败 → FAILED (完全回退 500N)
+       │
+       ├──→ 部分填充成功 ──→ FILLED_PENDING ──→ 迭代 N+1 独立验证
+       │                                            │
+       │                            ├─ 两侧都通过 → FILLED_PARTIAL
+       │                            ├─ 一侧通过 → FILLED_PARTIAL (部分回退)
+       │                            └─ 两侧都失败 → FAILED (完全回退 500N)
        │
        └──→ 填充失败 ──→ UNFILLABLE (永久跳过)
                     └──→ FAILED (下轮重试)
+```
+
+**部分回退逻辑：**
+```
+原始: [左侧翼][左填充][500N][右填充][右侧翼]
+
+左失败+右通过: [左侧翼][500N][右填充][右侧翼]
+左通过+右失败: [左侧翼][左填充][500N][右侧翼]
+两侧都失败:    [左侧翼][500N][右侧翼]
 ```
 
 ### GapStatus 枚举
@@ -297,16 +314,35 @@ TIER 6: Hybrid flanking + 500N → 最后备选
 
 **GapValidator 类：**
 - `validate_complete_fill()` - 验证完全填充
-- `validate_partial_fill()` - 验证部分填充
+- `validate_partial_fill()` - 验证部分填充（独立左右判断）
 - `pre_assess_gap()` - 预评估单个 gap 侧翼
 - `pre_assess_gaps()` - 批量预评估
 - `analyze_failed_gap()` - 分析失败原因
 
-**验证标准：**
-- Spanning reads 数量（短 gap ≥3，长 gap ≥5）
-- 覆盖度连续性（零覆盖比例 < 10%）
-- 平均覆盖度（≥ 3x）
-- Junction 质量（clip 比例 < 30%）
+**验证标准（完全填充 vs 部分填充）：**
+
+| 类型 | 验证标准 | 说明 |
+|------|----------|------|
+| **完全填充** | Spanning reads ≥3-5 | 必须有 reads 跨越整个填充区域 |
+| **部分填充** | Junction coverage ≥5, Insert coverage ≥5, 无断点 | 只检查连接点质量 |
+
+**部分填充独立左右验证：**
+- 左侧和右侧独立判断通过/失败
+- 通过的一侧保留，失败的一侧回退为 500N
+- 使用 `PartialFillValidationResult` 返回独立结果
+
+```python
+@dataclass
+class PartialFillValidationResult:
+    valid: bool              # 至少一侧通过
+    status: GapStatus
+    left_valid: bool         # 左侧是否通过
+    left_fill_length: int
+    left_junction_coverage: float
+    right_valid: bool        # 右侧是否通过
+    right_fill_length: int
+    right_junction_coverage: float
+```
 
 **GapStatusTracker 类：**
 - `add_pending_fill()` - 添加待验证的填充
