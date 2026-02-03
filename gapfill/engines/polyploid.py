@@ -1030,8 +1030,6 @@ class PolyploidEngine:
         self.logger.info("\nSTEP 4: Generating summary report")
         self._generate_summary(filled_assemblies, phaser)
 
-        # Mark as complete
-        _mark_done(self.output_dir, "complete")
         self.logger.info("Polyploid gap filling complete")
 
         return filled_assemblies

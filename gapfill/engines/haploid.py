@@ -345,156 +345,190 @@ class HaploidEngine:
                 break
 
             # Step 4: Fill gaps
-            self.logger.info("Step 4: Filling gaps...")
-            work_dir = iter_dir / "work"
-            work_dir.mkdir(exist_ok=True)
+            if not _is_done(iter_dir, "filling"):
+                self.logger.info("Step 4: Filling gaps...")
+                work_dir = iter_dir / "work"
+                work_dir.mkdir(exist_ok=True)
 
-            if self.parallel_filling and len(remaining_gaps) > 1:
-                # Parallel filling for multiple gaps
-                self.logger.info(f"  Using parallel filling ({self.threads} workers)...")
-                parallel_results = fill_gaps_parallel(
-                    gaps=remaining_gaps,
-                    assembly_file=str(current_assembly),
-                    hifi_bam=str(hifi_bam) if hifi_bam else None,
-                    ont_bam=str(ont_bam) if ont_bam else None,
-                    hifi_reads=str(self.hifi_reads) if self.hifi_reads else None,
-                    ont_reads=str(self.ont_reads) if self.ont_reads else None,
-                    work_dir=str(work_dir),
-                    threads=self.threads,
-                    min_mapq=self.min_mapq,
-                    use_consensus_first=True
-                )
-                # Convert parallel results to expected format
-                fill_results = {}
-                gap_lookup = {g['name']: g for g in remaining_gaps}
-                for gap_name, pr in parallel_results.items():
-                    if pr.get('result'):
-                        fill_results[gap_name] = {
-                            'gap': gap_lookup.get(gap_name, {'name': gap_name}),
-                            'result': pr['result']
-                        }
-                    else:
-                        fill_results[gap_name] = {
-                            'gap': gap_lookup.get(gap_name, {'name': gap_name}),
-                            'result': {'success': False, 'reason': pr.get('error', 'Unknown error')}
-                        }
-            else:
-                # Sequential filling
-                gap_filler = GapFiller(
-                    assembly_file=str(current_assembly),
-                    hifi_bam=str(hifi_bam) if hifi_bam else None,
-                    ont_bam=str(ont_bam) if ont_bam else None,
-                    hifi_reads=str(self.hifi_reads) if self.hifi_reads else None,
-                    ont_reads=str(self.ont_reads) if self.ont_reads else None,
-                    threads=self.threads,
-                    work_dir=str(work_dir),
-                    min_mapq=self.min_mapq,
-                    hic_analyzer=self.hic_analyzer,
-                    gap_size_estimates=self.gap_size_estimates,
-                    enable_consensus_first=True
-                )
-
-                fill_results = {}
-                for gap in remaining_gaps:
-                    result = gap_filler.fill_gap(gap)
-                    fill_results[gap['name']] = {'gap': gap, 'result': result}
-
-                gap_filler.close()
-
-            # Step 5: Process fill results (with HIGH-CONFIDENCE IMMEDIATE VALIDATION)
-            new_pending = 0
-            new_complete = 0  # High-confidence fills that skip delayed validation
-            new_unfillable = 0
-            new_failed = 0
-
-            # Track successful fills to apply to assembly
-            successful_fills = {}
-
-            for gap_name, data in fill_results.items():
-                gap = data['gap']
-                result = data['result']
-
-                if result.get('success'):
-                    # Fill succeeded
-                    successful_fills[gap_name] = data
-                    is_complete = result.get('is_complete', False) and not result.get('has_placeholder', False)
-
-                    # Check if this fill can skip delayed validation (high confidence)
-                    validation = result.get('validation', {})
-                    skip_delayed = validation.get('skip_delayed_validation', False)
-
-                    fill_seq = result.get('sequence', '')
-                    fill_length = len(fill_seq)
-                    original_gap_size = gap['end'] - gap['start']
-
-                    if skip_delayed and is_complete:
-                        # HIGH CONFIDENCE: Mark as FILLED_COMPLETE immediately
-                        new_complete += 1
-                        self.gap_tracker.set_status(
-                            gap_name, GapStatus.FILLED_COMPLETE,
-                            f"High-confidence fill: {result.get('source', 'unknown')} "
-                            f"(tier={result.get('tier', 0)}, cov={validation.get('avg_coverage', 0):.1f}x)"
-                        )
-                        self.checkpoint.add_completed_gap(gap_name, fill_seq)
-                        self.logger.info(f"    {gap_name}: ✓ filled & validated "
-                                       f"({result.get('source', 'unknown')}, "
-                                       f"{original_gap_size}bp -> {fill_length}bp)")
-                    else:
-                        # Standard: Mark as PENDING validation
-                        new_pending += 1
-                        self.gap_tracker.add_pending_fill(
-                            gap_id=gap_name,
-                            chrom=gap['chrom'],
-                            original_start=gap['start'],
-                            original_end=gap['end'],
-                            filled_start=gap['start'],
-                            filled_end=gap['start'] + fill_length,
-                            sequence=fill_seq,
-                            is_complete=is_complete,
-                            source=result.get('source', 'unknown'),
-                            tier=result.get('tier', 0)
-                        )
-                        self.logger.info(f"    {gap_name}: filled ({result.get('source', 'unknown')}, "
-                                       f"{original_gap_size}bp -> {fill_length}bp), pending validation")
+                if self.parallel_filling and len(remaining_gaps) > 1:
+                    # Parallel filling for multiple gaps
+                    self.logger.info(f"  Using parallel filling ({self.threads} workers)...")
+                    parallel_results = fill_gaps_parallel(
+                        gaps=remaining_gaps,
+                        assembly_file=str(current_assembly),
+                        hifi_bam=str(hifi_bam) if hifi_bam else None,
+                        ont_bam=str(ont_bam) if ont_bam else None,
+                        hifi_reads=str(self.hifi_reads) if self.hifi_reads else None,
+                        ont_reads=str(self.ont_reads) if self.ont_reads else None,
+                        work_dir=str(work_dir),
+                        threads=self.threads,
+                        min_mapq=self.min_mapq,
+                        use_consensus_first=True
+                    )
+                    # Convert parallel results to expected format
+                    fill_results = {}
+                    gap_lookup = {g['name']: g for g in remaining_gaps}
+                    for gap_name, pr in parallel_results.items():
+                        if pr.get('result'):
+                            fill_results[gap_name] = {
+                                'gap': gap_lookup.get(gap_name, {'name': gap_name}),
+                                'result': pr['result']
+                            }
+                        else:
+                            fill_results[gap_name] = {
+                                'gap': gap_lookup.get(gap_name, {'name': gap_name}),
+                                'result': {'success': False, 'reason': pr.get('error', 'Unknown error')}
+                            }
                 else:
-                    # Fill failed → analyze why
-                    validation = result.get('validation', {})
-                    validation_status = validation.get('status', '')
+                    # Sequential filling
+                    gap_filler = GapFiller(
+                        assembly_file=str(current_assembly),
+                        hifi_bam=str(hifi_bam) if hifi_bam else None,
+                        ont_bam=str(ont_bam) if ont_bam else None,
+                        hifi_reads=str(self.hifi_reads) if self.hifi_reads else None,
+                        ont_reads=str(self.ont_reads) if self.ont_reads else None,
+                        threads=self.threads,
+                        work_dir=str(work_dir),
+                        min_mapq=self.min_mapq,
+                        hic_analyzer=self.hic_analyzer,
+                        gap_size_estimates=self.gap_size_estimates,
+                        enable_consensus_first=True
+                    )
 
-                    if validation_status == 'unfillable':
-                        new_unfillable += 1
-                        self.gap_tracker.set_status(
-                            gap_name, GapStatus.UNFILLABLE,
-                            validation.get('reason', 'No spanning reads available')
-                        )
+                    fill_results = {}
+                    for gap in remaining_gaps:
+                        result = gap_filler.fill_gap(gap)
+                        fill_results[gap['name']] = {'gap': gap, 'result': result}
+
+                    gap_filler.close()
+
+                # Step 5: Process fill results (with HIGH-CONFIDENCE IMMEDIATE VALIDATION)
+                new_pending = 0
+                new_complete = 0  # High-confidence fills that skip delayed validation
+                new_unfillable = 0
+                new_failed = 0
+
+                # Track successful fills to apply to assembly
+                successful_fills = {}
+
+                for gap_name, data in fill_results.items():
+                    gap = data['gap']
+                    result = data['result']
+
+                    if result.get('success'):
+                        # Fill succeeded
+                        successful_fills[gap_name] = data
+                        is_complete = result.get('is_complete', False) and not result.get('has_placeholder', False)
+
+                        # Check if this fill can skip delayed validation (high confidence)
+                        validation = result.get('validation', {})
+                        skip_delayed = validation.get('skip_delayed_validation', False)
+
+                        fill_seq = result.get('sequence', '')
+                        fill_length = len(fill_seq)
+                        original_gap_size = gap['end'] - gap['start']
+
+                        if skip_delayed and is_complete:
+                            # HIGH CONFIDENCE: Mark as FILLED_COMPLETE immediately
+                            new_complete += 1
+                            self.gap_tracker.set_status(
+                                gap_name, GapStatus.FILLED_COMPLETE,
+                                f"High-confidence fill: {result.get('source', 'unknown')} "
+                                f"(tier={result.get('tier', 0)}, cov={validation.get('avg_coverage', 0):.1f}x)"
+                            )
+                            self.checkpoint.add_completed_gap(gap_name, fill_seq)
+                            self.logger.info(f"    {gap_name}: ✓ filled & validated "
+                                           f"({result.get('source', 'unknown')}, "
+                                           f"{original_gap_size}bp -> {fill_length}bp)")
+                        else:
+                            # Standard: Mark as PENDING validation
+                            new_pending += 1
+                            self.gap_tracker.add_pending_fill(
+                                gap_id=gap_name,
+                                chrom=gap['chrom'],
+                                original_start=gap['start'],
+                                original_end=gap['end'],
+                                filled_start=gap['start'],
+                                filled_end=gap['start'] + fill_length,
+                                sequence=fill_seq,
+                                is_complete=is_complete,
+                                source=result.get('source', 'unknown'),
+                                tier=result.get('tier', 0)
+                            )
+                            self.logger.info(f"    {gap_name}: filled ({result.get('source', 'unknown')}, "
+                                           f"{original_gap_size}bp -> {fill_length}bp), pending validation")
                     else:
-                        new_failed += 1
-                        self.gap_tracker.set_status(
-                            gap_name, GapStatus.FAILED,
-                            validation.get('reason', result.get('reason', 'Unknown failure'))
-                        )
+                        # Fill failed → analyze why
+                        validation = result.get('validation', {})
+                        validation_status = validation.get('status', '')
 
-                    failed_gaps.add(gap_name)
-                    self.checkpoint.add_failed_gap(gap_name)
+                        if validation_status == 'unfillable':
+                            new_unfillable += 1
+                            self.gap_tracker.set_status(
+                                gap_name, GapStatus.UNFILLABLE,
+                                validation.get('reason', 'No spanning reads available')
+                            )
+                        else:
+                            new_failed += 1
+                            self.gap_tracker.set_status(
+                                gap_name, GapStatus.FAILED,
+                                validation.get('reason', result.get('reason', 'Unknown failure'))
+                            )
 
-            self.logger.info(f"  Filled (confirmed): {new_complete}, "
-                           f"Filled (pending validation): {new_pending}, "
-                           f"Unfillable: {new_unfillable}, Failed: {new_failed}")
+                        failed_gaps.add(gap_name)
+                        self.checkpoint.add_failed_gap(gap_name)
+
+                self.logger.info(f"  Filled (confirmed): {new_complete}, "
+                               f"Filled (pending validation): {new_pending}, "
+                               f"Unfillable: {new_unfillable}, Failed: {new_failed}")
+
+                # Save fill results for potential resume
+                self._save_iteration_stats(iter_dir, iteration, fill_results)
+                self._save_gap_tracker()
+                _mark_done(iter_dir, "filling")
+            else:
+                self.logger.info("Step 4-5: Filling already done, loading results...")
+                # Load fill results from saved stats
+                stats_file = iter_dir / "iteration_stats.json"
+                successful_fills = {}
+                if stats_file.exists():
+                    with open(stats_file) as f:
+                        saved_stats = json.load(f)
+                    for fill_info in saved_stats.get('successful_fills', []):
+                        gap_name = fill_info['gap_name']
+                        # Reconstruct minimal fill data for apply step
+                        successful_fills[gap_name] = {
+                            'gap': {
+                                'chrom': fill_info['chrom'],
+                                'start': fill_info['original_start'],
+                                'end': fill_info['original_end'],
+                                'name': gap_name
+                            },
+                            'result': {
+                                'success': True,
+                                'sequence': 'N' * fill_info['fill_length']  # Placeholder, actual seq in assembly
+                            }
+                        }
 
             # Step 6: Apply fills to assembly
-            if successful_fills:
-                current_assembly = self._apply_fills(
-                    current_assembly, successful_fills, iter_dir
-                )
-
-            # Save iteration stats
-            self._save_iteration_stats(iter_dir, iteration, fill_results)
+            if not _is_done(iter_dir, "apply"):
+                if successful_fills:
+                    self.logger.info("Step 6: Applying fills to assembly...")
+                    current_assembly = self._apply_fills(
+                        current_assembly, successful_fills, iter_dir
+                    )
+                _mark_done(iter_dir, "apply")
+            else:
+                self.logger.info("Step 6: Apply already done, loading assembly...")
+                filled_asm = iter_dir / "assembly_filled.fasta"
+                if filled_asm.exists():
+                    current_assembly = filled_asm
 
             # Log status summary
             tracker_summary = self.gap_tracker.get_summary()
             self.logger.info(f"  Status summary: {tracker_summary}")
 
-            # Save gap tracker state and mark iteration complete
+            # Mark iteration complete
             self._save_gap_tracker()
             _mark_done(iter_dir, "iteration")
 
@@ -537,8 +571,6 @@ class HaploidEngine:
         self._save_final_stats()
         self._save_gap_tracker()
 
-        # Mark as complete
-        _mark_done(self.output_dir, "complete")
         self.logger.info("Gap filling complete")
 
         self.logger.info(f"\nFinal assembly: {final_assembly}")

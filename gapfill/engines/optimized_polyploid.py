@@ -553,8 +553,6 @@ class OptimizedPolyploidEngine:
 
         self._save_summary(final_assemblies, filled_gaps, failed_gaps, phaser)
 
-        # Mark as complete
-        _mark_done(self.output_dir, "complete")
         self.logger.info("Optimized polyploid gap filling complete")
 
         return final_assemblies
