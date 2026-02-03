@@ -111,13 +111,18 @@ class GapValidator:
         """
         Validate a completely filled gap
 
+        Validation strategy adapts to fill size:
+        - Small fills (<2kb): Require spanning reads + coverage
+        - Large fills (>=2kb): Focus on coverage continuity + boundary evidence
+
         Criteria:
-        1. Has spanning reads
-        2. Coverage is continuous (no zero-coverage regions)
-        3. Junctions are clean (low clip ratio)
-        4. Coverage level is adequate
+        1. Coverage is continuous (limited zero-coverage regions)
+        2. Coverage level is adequate
+        3. For small fills: require spanning reads
+        4. For large fills: require boundary-crossing reads
+        5. Junctions should be clean (low clip ratio)
         """
-        gap_length = gap_end - gap_start
+        fill_length = gap_end - gap_start
         bam = self._get_bam(bam_file)
         if bam is None:
             return ValidationResult(
@@ -129,35 +134,59 @@ class GapValidator:
         # Collect alignment statistics
         stats = self._analyze_region(bam, chrom, gap_start, gap_end)
 
-        # Determine thresholds based on gap size
-        min_spanning = (self.MIN_SPANNING_READS_SHORT
-                       if gap_length < 1000
-                       else self.MIN_SPANNING_READS_LONG)
-
         # Validation checks
         issues = []
+        warnings = []  # Non-fatal issues
 
-        # Check 1: Spanning reads
-        if stats['spanning_reads'] < min_spanning:
-            issues.append(f"Insufficient spanning reads: {stats['spanning_reads']} < {min_spanning}")
+        # Adapt validation based on fill size
+        is_large_fill = fill_length >= 2000
 
-        # Check 2: Coverage continuity
-        if stats['zero_coverage_ratio'] > self.MAX_ZERO_COVERAGE_RATIO:
+        # Check 1: Coverage continuity (required for all)
+        max_zero_ratio = 0.10 if is_large_fill else self.MAX_ZERO_COVERAGE_RATIO
+        if stats['zero_coverage_ratio'] > max_zero_ratio:
             issues.append(f"Coverage gaps: {stats['zero_coverage_ratio']*100:.1f}% zero coverage")
 
-        # Check 3: Average coverage
+        # Check 2: Average coverage (required for all)
         if stats['avg_coverage'] < self.MIN_AVG_COVERAGE:
             issues.append(f"Low coverage: {stats['avg_coverage']:.1f}x < {self.MIN_AVG_COVERAGE}x")
 
-        # Check 4: Junction quality
+        # Check 3: Spanning reads (strict for small fills, relaxed for large)
+        if is_large_fill:
+            # For large fills, spanning reads are rare - check boundary crossings instead
+            min_boundary_reads = 1
+            if (stats['left_boundary_reads'] < min_boundary_reads and
+                stats['right_boundary_reads'] < min_boundary_reads):
+                # No boundary evidence at all
+                if stats['spanning_reads'] == 0:
+                    issues.append(f"No spanning or boundary reads")
+            elif stats['spanning_reads'] == 0:
+                # Have boundary reads but no spanning - acceptable for large fills
+                warnings.append(f"No spanning reads (boundary reads: L={stats['left_boundary_reads']}, R={stats['right_boundary_reads']})")
+        else:
+            # For small fills, require spanning reads
+            min_spanning = (self.MIN_SPANNING_READS_SHORT
+                           if fill_length < 1000
+                           else self.MIN_SPANNING_READS_LONG)
+            if stats['spanning_reads'] < min_spanning:
+                issues.append(f"Insufficient spanning reads: {stats['spanning_reads']} < {min_spanning}")
+
+        # Check 4: Junction quality (warning for high clips)
         if stats['left_clip_ratio'] > self.MAX_JUNCTION_CLIP_RATIO:
-            issues.append(f"Left junction clips: {stats['left_clip_ratio']*100:.1f}%")
+            warnings.append(f"Left junction clips: {stats['left_clip_ratio']*100:.1f}%")
         if stats['right_clip_ratio'] > self.MAX_JUNCTION_CLIP_RATIO:
-            issues.append(f"Right junction clips: {stats['right_clip_ratio']*100:.1f}%")
+            warnings.append(f"Right junction clips: {stats['right_clip_ratio']*100:.1f}%")
+
+        # Junction clips are only fatal if coverage is also problematic
+        if (stats['left_clip_ratio'] > 0.5 or stats['right_clip_ratio'] > 0.5):
+            if stats['avg_coverage'] < 5.0:
+                issues.append(f"High junction clips with low coverage")
 
         # Determine result
         valid = len(issues) == 0
-        confidence = self._calculate_confidence(stats, gap_length, is_complete=True)
+        confidence = self._calculate_confidence(stats, fill_length, is_complete=True)
+
+        reason_parts = issues + warnings if not valid else warnings
+        reason = "; ".join(reason_parts) if reason_parts else "Validation passed"
 
         return ValidationResult(
             valid=valid,
@@ -171,7 +200,7 @@ class GapValidator:
             right_boundary_reads=stats['right_boundary_reads'],
             left_clip_ratio=stats['left_clip_ratio'],
             right_clip_ratio=stats['right_clip_ratio'],
-            reason="; ".join(issues) if issues else "Validation passed"
+            reason=reason
         )
 
     def validate_partial_fill(

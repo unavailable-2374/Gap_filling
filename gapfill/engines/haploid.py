@@ -356,6 +356,10 @@ class HaploidEngine:
                     validation = result.get('validation', {})
                     skip_delayed = validation.get('skip_delayed_validation', False)
 
+                    fill_seq = result.get('sequence', '')
+                    fill_length = len(fill_seq)
+                    original_gap_size = gap['end'] - gap['start']
+
                     if skip_delayed and is_complete:
                         # HIGH CONFIDENCE: Mark as FILLED_COMPLETE immediately
                         new_complete += 1
@@ -364,8 +368,10 @@ class HaploidEngine:
                             f"High-confidence fill: {result.get('source', 'unknown')} "
                             f"(tier={result.get('tier', 0)}, cov={validation.get('avg_coverage', 0):.1f}x)"
                         )
-                        self.checkpoint.add_completed_gap(gap_name, result.get('sequence', ''))
-                        self.logger.info(f"    {gap_name}: ✓ filled & validated ({result.get('source', 'unknown')})")
+                        self.checkpoint.add_completed_gap(gap_name, fill_seq)
+                        self.logger.info(f"    {gap_name}: ✓ filled & validated "
+                                       f"({result.get('source', 'unknown')}, "
+                                       f"{original_gap_size}bp -> {fill_length}bp)")
                     else:
                         # Standard: Mark as PENDING validation
                         new_pending += 1
@@ -375,14 +381,14 @@ class HaploidEngine:
                             original_start=gap['start'],
                             original_end=gap['end'],
                             filled_start=gap['start'],
-                            filled_end=gap['start'] + len(result.get('sequence', '')),
-                            sequence=result.get('sequence', ''),
+                            filled_end=gap['start'] + fill_length,
+                            sequence=fill_seq,
                             is_complete=is_complete,
                             source=result.get('source', 'unknown'),
                             tier=result.get('tier', 0)
                         )
-                        self.logger.info(f"    {gap_name}: filled ({result.get('source', 'unknown')}), "
-                                       f"pending validation")
+                        self.logger.info(f"    {gap_name}: filled ({result.get('source', 'unknown')}, "
+                                       f"{original_gap_size}bp -> {fill_length}bp), pending validation")
                 else:
                     # Fill failed → analyze why
                     validation = result.get('validation', {})
@@ -724,6 +730,8 @@ class HaploidEngine:
                         bam_file, pf.chrom, pf.filled_start, pf.filled_end, pf.sequence
                     )
 
+                fill_length = pf.filled_end - pf.filled_start
+
                 if result.valid:
                     validated_count += 1
                     if pf.is_complete:
@@ -735,14 +743,17 @@ class HaploidEngine:
                                                    f"Validated: {result.reason}")
                         self.checkpoint.add_partial_gap(gap_id, pf.sequence)
 
-                    self.logger.info(f"      ✓ Validated (cov={result.avg_coverage:.1f}x, "
-                                   f"spanning={result.spanning_reads})")
+                    self.logger.info(f"      ✓ Validated {fill_length}bp fill "
+                                   f"(cov={result.avg_coverage:.1f}x, spanning={result.spanning_reads}, "
+                                   f"boundary L/R={result.left_boundary_reads}/{result.right_boundary_reads})")
                 else:
                     failed_count += 1
                     fills_to_revert.append(pf)
                     self.gap_tracker.set_status(gap_id, GapStatus.FAILED,
                                                f"Validation failed: {result.reason}")
-                    self.logger.warning(f"      ✗ Failed: {result.reason}")
+                    self.logger.warning(f"      ✗ Failed {fill_length}bp fill: {result.reason} "
+                                       f"(cov={result.avg_coverage:.1f}x, spanning={result.spanning_reads}, "
+                                       f"zero_cov={result.zero_coverage_ratio*100:.1f}%)")
 
         finally:
             validator.close()
@@ -933,7 +944,13 @@ class HaploidEngine:
             self.logger.error(f"Alignment failed: {e}")
 
     def _apply_fills(self, assembly: Path, fill_results: Dict, output_dir: Path) -> Path:
-        """Apply gap fills to assembly"""
+        """
+        Apply gap fills to assembly and update pending fill coordinates.
+
+        Fills are applied from end to start to avoid coordinate shifts affecting
+        fills yet to be applied. After applying, we update the pending fills'
+        coordinates to reflect their actual positions in the new assembly.
+        """
         filled_assembly = output_dir / "assembly_filled.fasta"
 
         # Load assembly
@@ -941,7 +958,7 @@ class HaploidEngine:
         for record in SeqIO.parse(assembly, 'fasta'):
             sequences[record.id] = str(record.seq)
 
-        # Group fills by chromosome
+        # Group fills by chromosome with gap names for tracking
         fills_by_chrom = {}
         for gap_name, data in fill_results.items():
             if not data['result']['success']:
@@ -951,12 +968,18 @@ class HaploidEngine:
             if chrom not in fills_by_chrom:
                 fills_by_chrom[chrom] = []
             fills_by_chrom[chrom].append({
+                'gap_name': gap_name,
                 'start': gap['start'],
                 'end': gap['end'],
-                'sequence': data['result']['sequence']
+                'sequence': data['result']['sequence'],
+                'fill_length': len(data['result']['sequence'])
             })
 
-        # Apply fills (from end to start)
+        # Track coordinate shifts per chromosome for updating pending fills
+        # Key: (chrom, original_start) -> new_start, new_end
+        coordinate_updates = {}
+
+        # Apply fills (from end to start) and track coordinate shifts
         for chrom, fills in fills_by_chrom.items():
             if chrom not in sequences:
                 continue
@@ -964,10 +987,40 @@ class HaploidEngine:
             seq = sequences[chrom]
             fills_sorted = sorted(fills, key=lambda x: x['start'], reverse=True)
 
+            # Track cumulative offset for this chromosome
+            cumulative_offset = 0
+
             for fill in fills_sorted:
-                seq = seq[:fill['start']] + fill['sequence'] + seq[fill['end']:]
+                original_start = fill['start']
+                original_end = fill['end']
+                fill_seq = fill['sequence']
+                fill_length = len(fill_seq)
+                gap_length = original_end - original_start
+
+                # Apply fill
+                seq = seq[:original_start] + fill_seq + seq[original_end:]
+
+                # Calculate actual position in new assembly
+                # Since we're going from end to start, this fill's position is not affected
+                # by previous fills in this loop (they were all after this one)
+                actual_start = original_start
+                actual_end = original_start + fill_length
+
+                # Store the coordinate update
+                coordinate_updates[(chrom, original_start, original_end)] = (actual_start, actual_end)
 
             sequences[chrom] = seq
+
+        # Update pending fills with correct coordinates
+        pending_fills = self.gap_tracker.get_pending_fills()
+        for gap_id, pf in pending_fills.items():
+            key = (pf.chrom, pf.original_start, pf.original_end)
+            if key in coordinate_updates:
+                new_start, new_end = coordinate_updates[key]
+                # Update the pending fill's coordinates
+                pf.filled_start = new_start
+                pf.filled_end = new_end
+                self.logger.debug(f"    Updated {gap_id} coordinates: {pf.original_start}-{pf.original_end} -> {new_start}-{new_end}")
 
         # Write filled assembly
         with open(filled_assembly, 'w') as f:
@@ -979,15 +1032,57 @@ class HaploidEngine:
         return filled_assembly
 
     def _save_iteration_stats(self, output_dir: Path, iteration: int, fill_results: Dict):
-        """Save iteration statistics"""
+        """Save iteration statistics including fill lengths"""
+        successful_fills = []
+        failed_fills = []
+        total_bp_filled = 0
+
+        for gap_name, data in fill_results.items():
+            gap = data['gap']
+            result = data['result']
+            original_size = gap['end'] - gap['start']
+
+            if result.get('success'):
+                fill_length = len(result.get('sequence', ''))
+                total_bp_filled += fill_length
+                successful_fills.append({
+                    'gap_name': gap_name,
+                    'chrom': gap['chrom'],
+                    'original_start': gap['start'],
+                    'original_end': gap['end'],
+                    'original_size': original_size,
+                    'fill_length': fill_length,
+                    'source': result.get('source', 'unknown'),
+                    'tier': result.get('tier', 0),
+                    'is_complete': result.get('is_complete', False),
+                    'has_placeholder': result.get('has_placeholder', False)
+                })
+            else:
+                failed_fills.append({
+                    'gap_name': gap_name,
+                    'chrom': gap['chrom'],
+                    'original_size': original_size,
+                    'reason': result.get('reason', 'unknown')
+                })
+
         stats = {
             'iteration': iteration,
             'gaps_processed': len(fill_results),
+            'gaps_filled': len(successful_fills),
+            'gaps_failed': len(failed_fills),
+            'total_bp_filled': total_bp_filled,
+            'successful_fills': successful_fills,
+            'failed_fills': failed_fills,
             'timestamp': datetime.now().isoformat()
         }
 
         with open(output_dir / "iteration_stats.json", 'w') as f:
             json.dump(stats, f, indent=2)
+
+        # Log summary
+        self.logger.info(f"  Iteration {iteration} summary: "
+                        f"{len(successful_fills)} filled ({total_bp_filled:,} bp total), "
+                        f"{len(failed_fills)} failed")
 
     def _save_final_stats(self):
         """Save final statistics"""
