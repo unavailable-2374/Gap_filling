@@ -1375,6 +1375,7 @@ class PolyploidEngine:
         self.logger.info(f"    ONT: {ont_reads}")
         self.logger.info(f"    Hi-C BAM: {hic_bam}")
         self.logger.info(f"    Skip normalization: {skip_normalization}")
+        self.logger.info(f"    Resume: {self.resume}")
 
         # Disable reads filtering in HaploidEngine because:
         # - Reads are already filtered at polyploid STEP 2 (based on BAM alignment)
@@ -1390,7 +1391,8 @@ class PolyploidEngine:
             max_iterations=self.max_iterations,
             skip_normalization=skip_normalization,
             optimized_mode=False,  # Already filtered at polyploid level
-            parallel_filling=True  # Parallel gap filling
+            parallel_filling=True,  # Parallel gap filling
+            resume=self.resume  # Pass resume flag to HaploidEngine
         )
 
         return engine.run()
