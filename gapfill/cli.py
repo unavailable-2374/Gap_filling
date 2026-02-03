@@ -42,9 +42,6 @@ Examples:
     # Reads
     parser.add_argument("--hifi", dest="hifi_reads", help="HiFi reads (FASTQ/FASTA)")
     parser.add_argument("--ont", dest="ont_reads", help="ONT reads (FASTQ/FASTA)")
-    parser.add_argument("--hic", dest="hic_reads", nargs=2, metavar=('R1', 'R2'),
-                       help="Hi-C reads (R1 and R2 FASTQ files)")
-    parser.add_argument("--hic-bam", dest="hic_bam", help="Pre-aligned Hi-C BAM file")
 
     # Output
     parser.add_argument("-o", "--output", default="gapfill_output", help="Output directory")
@@ -142,8 +139,6 @@ Examples:
             assembly_file=args.assembly[0],
             hifi_reads=args.hifi_reads,
             ont_reads=args.ont_reads,
-            hic_reads=args.hic_reads,
-            hic_bam=args.hic_bam,
             output_dir=args.output,
             threads=args.threads,
             max_iterations=args.max_iterations,
@@ -173,8 +168,6 @@ Examples:
                 haplotype_assemblies=args.assembly,
                 hifi_reads=args.hifi_reads,
                 ont_reads=args.ont_reads,
-                hic_reads=args.hic_reads,
-                hic_bam=args.hic_bam,
                 output_dir=args.output,
                 threads=args.threads,
                 max_iterations=args.max_iterations,
@@ -191,8 +184,6 @@ Examples:
                 haplotype_assemblies=args.assembly,
                 hifi_reads=args.hifi_reads,
                 ont_reads=args.ont_reads,
-                hic_reads=args.hic_reads,
-                hic_bam=args.hic_bam,
                 output_dir=args.output,
                 threads=args.threads,
                 max_iterations=args.max_iterations,

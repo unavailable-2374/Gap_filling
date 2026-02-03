@@ -1,6 +1,6 @@
 # GapFill
 
-Gap filling tool for haploid and polyploid genome assemblies using long-read sequencing data (HiFi and/or ONT), with optional Hi-C integration.
+Gap filling tool for haploid and polyploid genome assemblies using long-read sequencing data (HiFi and/or ONT).
 
 ## Features
 
@@ -9,7 +9,6 @@ Gap filling tool for haploid and polyploid genome assemblies using long-read seq
 - **HiFi + ONT integration** - 7-tier strategy prioritizing HiFi accuracy with ONT length advantage
 - **Delayed validation** - Validates fills in next iteration using properly aligned reads
 - **Automatic flank polishing** - Detects and polishes problematic flanking sequences
-- **Hi-C data support** - Gap size estimation, candidate selection, and fill validation
 - **Checkpoint/resume** - Resume interrupted runs using .ok file markers
 - **Optimized polyploid mode** - Batch alignment reduces computation by 75%+ for polyploid genomes
 
@@ -36,7 +35,6 @@ conda install -c bioconda minimap2 samtools wtdbg
 
 # Optional but recommended
 conda install -c bioconda racon        # Flank polishing & ONT assembly polish
-conda install -c bioconda bwa-mem2     # Hi-C alignment
 conda install -c bioconda bcftools     # Polyploid SNP calling
 conda install -c bioconda whatshap     # Alternative phasing method
 ```
@@ -59,9 +57,6 @@ python -m gapfill -a assembly.fa --hifi hifi.fq.gz -o output
 
 # HiFi + ONT
 python -m gapfill -a assembly.fa --hifi hifi.fq.gz --ont ont.fq.gz -o output
-
-# With Hi-C data
-python -m gapfill -a assembly.fa --hifi hifi.fq.gz --hic hic_R1.fq.gz hic_R2.fq.gz -o output
 
 # Resume interrupted run
 python -m gapfill -a assembly.fa --hifi hifi.fq.gz -o output --resume
@@ -95,8 +90,6 @@ Required:
 Reads (at least one required):
   --hifi FILE               HiFi reads (FASTQ/FASTA, gzipped OK)
   --ont FILE                ONT reads (FASTQ/FASTA, gzipped OK)
-  --hic R1 R2               Hi-C paired-end reads
-  --hic-bam FILE            Pre-aligned Hi-C BAM file
 
 Output:
   -o, --output DIR          Output directory (default: gapfill_output)
@@ -220,17 +213,6 @@ GapFill uses a hierarchical approach prioritizing accuracy:
 **Re-alignment after revert:**
 When validation fails and fills are reverted, reads are re-aligned to the reverted assembly before the next filling attempt. This ensures gap coordinates are accurate.
 
-### Hi-C Integration
-
-When Hi-C data is provided:
-
-| Stage | Purpose | Method |
-|-------|---------|--------|
-| Pre-filling | Estimate true gap sizes | Contact frequency analysis |
-| During filling | Select best candidate | Hi-C contact consistency scoring |
-| Post-filling | Validate fills | Detect contact anomalies |
-| Polyploid | Enhance phasing | Long-range haplotype links |
-
 ### Polyploid Optimization
 
 **Reads Filtering (default enabled):**
@@ -279,14 +261,13 @@ gapfill/
 │   ├── consensus.py              # ConsensusBuilder - direct consensus (Tier 0)
 │   └── parallel.py               # Parallel gap filling support
 ├── engines/
-│   ├── haploid.py                # HaploidEngine - haploid mode + Hi-C
+│   ├── haploid.py                # HaploidEngine - haploid mode
 │   ├── polyploid.py              # PolyploidEngine - standard polyploid
 │   └── optimized_polyploid.py    # OptimizedPolyploidEngine - batch alignment
 └── utils/
     ├── indexer.py                # AssemblyIndexer
     ├── scanner.py                # GapScanner
     ├── tempfiles.py              # TempFileManager
-    ├── hic.py                    # HiCAnalyzer - Hi-C data analysis
     ├── checkpoint.py             # CheckpointManager - resume support
     └── reads_cache.py            # ReadsCache - filtered reads caching
 ```
@@ -358,9 +339,7 @@ output/
     "unfillable": 5,
     "failed": 5
   },
-  "total_bp_filled": 1500000,
-  "hic_validated": 115,
-  "hic_failed": 5
+  "total_bp_filled": 1500000
 }
 ```
 
@@ -383,10 +362,9 @@ By default, haploid mode enables all optimizations:
 
 1. **Use `--optimized` for polyploid** - Significantly reduces runtime (75%+ fewer alignments)
 2. **Provide both HiFi and ONT** - Combines accuracy and length advantages
-3. **Add Hi-C data** - Improves fill quality and enables validation
-4. **Use `--resume`** - Resume interrupted runs without recomputing
-5. **Adjust `--max-iterations`** - More iterations may fill more gaps but with diminishing returns
-6. **Use SSD storage** - Alignment I/O benefits from fast storage
+3. **Use `--resume`** - Resume interrupted runs without recomputing
+4. **Adjust `--max-iterations`** - More iterations may fill more gaps but with diminishing returns
+5. **Use SSD storage** - Alignment I/O benefits from fast storage
 
 ### When to Disable Optimizations
 

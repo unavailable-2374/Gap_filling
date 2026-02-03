@@ -8,8 +8,7 @@ OPTIMIZATIONS:
 3. Different wtdbg2 presets for different read types
 4. Optional HiFi polish for ONT assemblies
 5. Source tracking for quality assessment
-6. Hi-C guided candidate selection when multiple assemblies produced
-7. Integrated validation with flank analysis
+6. Integrated validation with flank analysis
 
 Strategy tiers:
   TIER 0: Direct consensus (for highly consistent spanning reads)
@@ -25,7 +24,7 @@ import logging
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, TYPE_CHECKING
+from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 
 import pysam
@@ -35,9 +34,6 @@ from gapfill.utils.indexer import AssemblyIndexer
 from gapfill.core.validator import (GapValidator, GapStatus, ValidationResult,
                                      PartialFillValidationResult)
 from gapfill.core.consensus import ConsensusBuilder, try_consensus_fill
-
-if TYPE_CHECKING:
-    from gapfill.utils.hic import HiCAnalyzer
 
 
 class GapFiller:
@@ -59,9 +55,7 @@ class GapFiller:
                  min_overlap: int = 100,
                  enable_polish: bool = True,
                  enable_validation: bool = True,
-                 enable_consensus_first: bool = True,
-                 hic_analyzer: Optional['HiCAnalyzer'] = None,
-                 gap_size_estimates: Optional[Dict[str, int]] = None):
+                 enable_consensus_first: bool = True):
 
         self.assembly_file = Path(assembly_file)
         self.hifi_bam = Path(hifi_bam) if hifi_bam else None
@@ -77,8 +71,6 @@ class GapFiller:
         self.enable_polish = enable_polish
         self.enable_validation = enable_validation
         self.enable_consensus_first = enable_consensus_first
-        self.hic_analyzer = hic_analyzer
-        self.gap_size_estimates = gap_size_estimates or {}
 
         self.logger = logging.getLogger(__name__)
         self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -91,12 +83,10 @@ class GapFiller:
         # Check available data types
         self.has_hifi = self.hifi_bam is not None and self.hifi_bam.exists()
         self.has_ont = self.ont_bam is not None and self.ont_bam.exists()
-        self.has_hic = self.hic_analyzer is not None
 
         self.logger.info(f"GapFiller initialized (tiered HiFi/ONT strategy)")
         self.logger.info(f"  HiFi BAM: {self.hifi_bam} ({'available' if self.has_hifi else 'not available'})")
         self.logger.info(f"  ONT BAM: {self.ont_bam} ({'available' if self.has_ont else 'not available'})")
-        self.logger.info(f"  Hi-C: {'available' if self.has_hic else 'not available'}")
         self.logger.info(f"  Polish enabled: {self.enable_polish}")
         self.logger.info(f"  Validation enabled: {self.enable_validation}")
 
@@ -976,8 +966,7 @@ class GapFiller:
                              gap_info: Optional[Dict] = None) -> Optional[str]:
         """Run wtdbg2 assembly with type-specific parameters
 
-        If Hi-C is available and multiple contigs are produced,
-        uses Hi-C contact frequency to select the best candidate.
+        Returns the longest contig sequence if multiple are produced.
         """
         output_prefix = work_dir / f"{prefix}_wtdbg2"
 
@@ -1015,12 +1004,8 @@ class GapFiller:
             if read_count < 3:
                 return None
 
-            # Smarter genome size estimation
-            # Use Hi-C estimate if available, otherwise estimate from read stats
-            if gap_info and gap_info.get('name') in self.gap_size_estimates:
-                estimated_size = self.gap_size_estimates[gap_info['name']]
-                self.logger.debug(f"    Using Hi-C estimated size: {estimated_size}bp")
-            elif read_count >= 5:
+            # Genome size estimation from read stats
+            if read_count >= 5:
                 # Use 80% of average read length as estimate
                 avg_read_len = total_bases / read_count
                 estimated_size = max(int(avg_read_len * 0.8), 5000)
@@ -1059,137 +1044,15 @@ class GapFiller:
                 if not sequences:
                     return None
 
-                # If only one sequence or no Hi-C, return longest
-                if len(sequences) == 1 or not self.has_hic or not gap_info:
-                    best_seq = max(sequences, key=lambda x: len(x.seq))
-                    return str(best_seq.seq)
-
-                # Multiple candidates + Hi-C available: use Hi-C to select
-                self.logger.debug(f"    {len(sequences)} candidate contigs, using Hi-C to select")
-                best_seq = self._select_best_candidate_with_hic(
-                    sequences, gap_info, work_dir
-                )
-                return best_seq
+                # Return longest sequence
+                best_seq = max(sequences, key=lambda x: len(x.seq))
+                return str(best_seq.seq)
 
             return None
 
         except Exception as e:
             self.logger.warning(f"wtdbg2 error: {e}")
             return None
-
-    def _select_best_candidate_with_hic(self, candidates: List,
-                                         gap_info: Dict,
-                                         work_dir: Path) -> Optional[str]:
-        """
-        Select best candidate sequence using Hi-C contact consistency.
-
-        Strategy:
-        - For each candidate, simulate inserting it into the gap
-        - Score based on Hi-C contact frequency with flanking regions
-        - Higher contact frequency = more likely correct
-        """
-        if not self.hic_analyzer or not candidates:
-            # Fall back to longest
-            return str(max(candidates, key=lambda x: len(x.seq)).seq)
-
-        chrom = gap_info['chrom']
-        gap_start = gap_info['start']
-        gap_end = gap_info['end']
-
-        scores = []
-
-        for i, record in enumerate(candidates):
-            seq = str(record.seq)
-            seq_len = len(seq)
-
-            # Score based on:
-            # 1. Sequence length closer to estimated gap size
-            # 2. Hi-C contact consistency (if available)
-
-            # Length score: prefer sequences close to estimated size
-            estimated_size = self.gap_size_estimates.get(gap_info.get('name', ''), gap_end - gap_start)
-            length_diff = abs(seq_len - estimated_size)
-            length_score = max(0, 1.0 - length_diff / max(estimated_size, 1000))
-
-            # Hi-C score: check contact frequency with flanking regions
-            hic_score = self._compute_hic_consistency_score(
-                chrom, gap_start, gap_end, seq_len
-            )
-
-            # Combined score (weighted)
-            combined_score = 0.3 * length_score + 0.7 * hic_score
-            scores.append((combined_score, seq_len, seq))
-
-            self.logger.debug(f"    Candidate {i+1}: {seq_len}bp, "
-                            f"length_score={length_score:.2f}, "
-                            f"hic_score={hic_score:.2f}, "
-                            f"combined={combined_score:.2f}")
-
-        # Select best scoring candidate
-        best = max(scores, key=lambda x: (x[0], x[1]))  # Score, then length
-        self.logger.debug(f"    Selected: {best[1]}bp (score={best[0]:.2f})")
-
-        return best[2]
-
-    def _compute_hic_consistency_score(self, chrom: str, gap_start: int,
-                                        gap_end: int, fill_length: int) -> float:
-        """
-        Compute Hi-C consistency score for a potential fill.
-
-        Checks if Hi-C contacts across the gap region are consistent
-        with the proposed fill length.
-        """
-        if not self.hic_analyzer:
-            return 0.5  # Neutral score
-
-        try:
-            # Get Hi-C contact matrix around gap region
-            window = 10000
-            region_start = max(0, gap_start - window)
-            region_end = gap_end + window
-
-            matrix = self.hic_analyzer.get_contact_matrix(
-                chrom, region_start, region_end, resolution=1000
-            )
-
-            if matrix is None or matrix.size == 0:
-                return 0.5
-
-            # Calculate expected vs observed contact pattern
-            # Contacts should decay with distance
-            # If fill is correct size, decay pattern should be smooth
-
-            n_bins = matrix.shape[0]
-            gap_bin_start = (gap_start - region_start) // 1000
-            gap_bin_end = (gap_end - region_start) // 1000
-
-            # Check contacts between left flank and right flank
-            left_bins = range(max(0, gap_bin_start - 5), gap_bin_start)
-            right_bins = range(gap_bin_end, min(n_bins, gap_bin_end + 5))
-
-            cross_contacts = 0
-            for lb in left_bins:
-                for rb in right_bins:
-                    if 0 <= lb < n_bins and 0 <= rb < n_bins:
-                        cross_contacts += matrix[lb, rb]
-
-            # Normalize by region size
-            n_left = len(list(left_bins))
-            n_right = len(list(right_bins))
-            if n_left > 0 and n_right > 0:
-                avg_contacts = cross_contacts / (n_left * n_right)
-
-                # Score: more contacts = better connectivity = higher score
-                # Typical Hi-C contact at ~10kb distance
-                expected_contacts = 5  # Baseline expectation
-                score = min(1.0, avg_contacts / expected_contacts)
-                return score
-
-            return 0.5
-
-        except Exception as e:
-            self.logger.debug(f"    Hi-C scoring error: {e}")
-            return 0.5
 
     def _finalize_result(self, result: Dict, gap: Dict, reads_info: Dict) -> Dict:
         """

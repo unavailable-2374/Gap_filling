@@ -30,7 +30,6 @@ from gapfill.core.filler import GapFiller
 from gapfill.core.validator import (GapValidator, GapStatusTracker, GapStatus, PendingFill,
                                      PartialFillValidationResult)
 from gapfill.core.parallel import fill_gaps_parallel, fill_gaps_sequential, GapBatcher
-from gapfill.utils.hic import HiCAnalyzer, align_hic_reads
 from gapfill.utils.checkpoint import CheckpointManager, CheckpointState
 from gapfill.utils.reads_cache import ReadsCache, GapReadsExtractor
 
@@ -68,8 +67,6 @@ class HaploidEngine:
                  assembly_file: str,
                  hifi_reads: Optional[str] = None,
                  ont_reads: Optional[str] = None,
-                 hic_reads: Optional[List[str]] = None,
-                 hic_bam: Optional[str] = None,
                  output_dir: str = "output",
                  threads: int = 8,
                  max_iterations: int = 10,
@@ -84,8 +81,6 @@ class HaploidEngine:
         self.initial_assembly = Path(assembly_file)
         self.hifi_reads = Path(hifi_reads) if hifi_reads else None
         self.ont_reads = Path(ont_reads) if ont_reads else None
-        self.hic_reads = hic_reads  # [R1, R2] or None
-        self.hic_bam = Path(hic_bam) if hic_bam else None
         self.output_dir = Path(output_dir)
         self.threads = threads
         self.max_iterations = max_iterations
@@ -107,10 +102,6 @@ class HaploidEngine:
         if clear_checkpoint:
             self.checkpoint.clear()
 
-        # Hi-C analyzer (initialized when needed)
-        self.hic_analyzer: Optional[HiCAnalyzer] = None
-        self.gap_size_estimates: Dict[str, int] = {}
-
         # Gap status tracker (tracks UNFILLABLE, NEEDS_POLISH, etc.)
         self.gap_tracker = GapStatusTracker()
         self.gap_tracker_file = self.output_dir / "gap_tracker.json"
@@ -126,18 +117,13 @@ class HaploidEngine:
         self._preprocessing_assembly: Optional[Path] = None
         self._can_reuse_preprocessing_bam: bool = False
 
-        # Store initial gaps for later Hi-C validation
-        self.initial_gaps: List[Dict] = []
-
         self.stats = {
             'iterations': 0,
             'total_gaps_initial': 0,
             'gaps_completely_filled': 0,
             'gaps_partially_filled': 0,
             'gaps_failed': 0,
-            'total_bp_filled': 0,
-            'hic_validated': 0,
-            'hic_failed': 0
+            'total_bp_filled': 0
         }
 
         self.logger.info("=" * 60)
@@ -145,8 +131,6 @@ class HaploidEngine:
         self.logger.info(f"  Assembly: {self.initial_assembly}")
         self.logger.info(f"  HiFi reads: {self.hifi_reads}")
         self.logger.info(f"  ONT reads: {self.ont_reads}")
-        self.logger.info(f"  Hi-C reads: {self.hic_reads}")
-        self.logger.info(f"  Hi-C BAM: {self.hic_bam}")
         self.logger.info(f"  Output dir: {self.output_dir}")
         self.logger.info(f"  Resume: {self.resume}")
         self.logger.info(f"  Optimized mode: {self.optimized_mode}")
@@ -214,9 +198,8 @@ class HaploidEngine:
             self._save_gap_tracker()
         else:
             self.logger.info("Skipping preprocessing (already done)")
-            # Load initial gaps for later Hi-C validation
-            self.initial_gaps = self._find_gaps(current_assembly)
-            self.stats['total_gaps_initial'] = len(self.initial_gaps)
+            gaps = self._find_gaps(current_assembly)
+            self.stats['total_gaps_initial'] = len(gaps)
 
         # =====================================================================
         # ITERATION LOOP
@@ -390,8 +373,6 @@ class HaploidEngine:
                         threads=self.threads,
                         work_dir=str(work_dir),
                         min_mapq=self.min_mapq,
-                        hic_analyzer=self.hic_analyzer,
-                        gap_size_estimates=self.gap_size_estimates,
                         enable_consensus_first=True
                     )
 
@@ -549,25 +530,6 @@ class HaploidEngine:
         self.stats['gaps_failed'] = len(failed_gaps)
         self.stats['gap_status_summary'] = self.gap_tracker.get_summary()
 
-        # Hi-C validation of filled gaps
-        if self.hic_analyzer and completely_filled_gaps:
-            self.logger.info("\nValidating fills with Hi-C...")
-            filled_gaps_list = [
-                gap for gap in self.initial_gaps
-                if gap['name'] in completely_filled_gaps
-            ]
-            if filled_gaps_list:
-                validations = self.hic_analyzer.validate_fills(
-                    filled_gaps_list, str(final_assembly)
-                )
-                for v in validations:
-                    if v.is_valid:
-                        self.stats['hic_validated'] += 1
-                    else:
-                        self.stats['hic_failed'] += 1
-                        self.logger.warning(f"  Hi-C validation failed: {v.gap_name} "
-                                          f"(anomaly: {v.anomaly_type})")
-
         self._save_final_stats()
         self._save_gap_tracker()
 
@@ -655,12 +617,11 @@ class HaploidEngine:
         Run preprocessing phase before iteration loop.
 
         Steps:
-        1. Hi-C preparation (if available)
-        2. Gap normalization
-        3. Initial alignment
+        1. Gap normalization
+        2. Initial alignment
+        3. Filter reads (if optimized mode)
         4. Pre-assess gap flanks
         5. Polish problematic flanks
-        6. Re-align after polish (if needed)
 
         Returns:
             Path to preprocessed assembly (normalized and polished)
@@ -671,53 +632,32 @@ class HaploidEngine:
 
         # Step 0a: Find initial gaps
         initial_gaps = self._find_gaps(current_assembly)
-        self.initial_gaps = initial_gaps  # Store for later Hi-C validation
         self.stats['total_gaps_initial'] = len(initial_gaps)
         self.logger.info(f"Initial gaps found: {len(initial_gaps)}")
 
-        # Step 0b: Prepare Hi-C data if available
-        if self.hic_reads or self.hic_bam:
-            hic_bam_file = preprocess_dir / "hic.bam"
-            if _is_done(preprocess_dir, "hic") and hic_bam_file.exists():
-                self.logger.info(f"STEP 0b: Reusing existing Hi-C BAM")
-                self.hic_bam = hic_bam_file
-            else:
-                self.logger.info("STEP 0b: Preparing Hi-C data")
-                self._prepare_hic_data(current_assembly)
-                _mark_done(preprocess_dir, "hic")
-
-            # Estimate gap sizes using Hi-C
-            if self.hic_analyzer and initial_gaps:
-                self.logger.info("  Estimating gap sizes with Hi-C...")
-                estimates = self.hic_analyzer.estimate_gap_sizes(initial_gaps)
-                for est in estimates:
-                    if est.confidence in ('high', 'medium'):
-                        self.gap_size_estimates[est.gap_name] = est.estimated_size
-                        self.logger.info(f"    {est.gap_name}: estimated {est.estimated_size}bp")
-
-        # Step 0c: Normalize gaps
+        # Step 0b: Normalize gaps
         normalized_file = self.output_dir / "assembly_normalized.fasta"
         if _is_done(self.output_dir, "normalized") and normalized_file.exists():
-            self.logger.info(f"STEP 0c: Reusing normalized assembly")
+            self.logger.info(f"STEP 0b: Reusing normalized assembly")
             current_assembly = normalized_file
         elif initial_gaps and not self.skip_normalization:
-            self.logger.info("STEP 0c: Normalizing gaps to 500N...")
+            self.logger.info("STEP 0b: Normalizing gaps to 500N...")
             current_assembly = self._normalize_gaps(current_assembly, initial_gaps)
             _mark_done(self.output_dir, "normalized")
         elif self.skip_normalization:
-            self.logger.info("STEP 0c: Skipping normalization (already done)")
+            self.logger.info("STEP 0b: Skipping normalization (already done)")
             import shutil
             shutil.copy(current_assembly, normalized_file)
             current_assembly = normalized_file
             _mark_done(self.output_dir, "normalized")
 
-        # Step 0d: Initial alignment for pre-assessment
+        # Step 0c: Initial alignment for pre-assessment
         if not _is_done(preprocess_dir, "alignment"):
-            self.logger.info("STEP 0d: Initial alignment for pre-assessment...")
+            self.logger.info("STEP 0c: Initial alignment for pre-assessment...")
             hifi_bam, ont_bam = self._align_reads_with_cache(current_assembly, preprocess_dir)
             _mark_done(preprocess_dir, "alignment")
         else:
-            self.logger.info("STEP 0d: Reusing existing alignment...")
+            self.logger.info("STEP 0c: Reusing existing alignment...")
             hifi_bam = preprocess_dir / "hifi.bam" if (preprocess_dir / "hifi.bam").exists() else None
             ont_bam = preprocess_dir / "ont.bam" if (preprocess_dir / "ont.bam").exists() else None
 
@@ -730,10 +670,10 @@ class HaploidEngine:
             self.logger.warning("  No BAM files for pre-assessment, skipping polish")
             return current_assembly
 
-        # Step 0e: Filter reads (OPTIMIZATION - filter once, use many times)
+        # Step 0d: Filter reads (OPTIMIZATION - filter once, use many times)
         if self.optimized_mode and self.reads_cache:
             if not _is_done(preprocess_dir, "filter"):
-                self.logger.info("STEP 0e: Filtering reads (keeping gap-related reads only)...")
+                self.logger.info("STEP 0d: Filtering reads (keeping gap-related reads only)...")
                 gaps = self._find_gaps(current_assembly)
                 self.reads_cache.set_gap_regions(gaps)
 
@@ -753,23 +693,23 @@ class HaploidEngine:
 
                 _mark_done(preprocess_dir, "filter")
             else:
-                self.logger.info("STEP 0e: Reads already filtered")
+                self.logger.info("STEP 0d: Reads already filtered")
                 # Re-initialize reads_cache with existing gaps
                 gaps = self._find_gaps(current_assembly)
                 self.reads_cache.set_gap_regions(gaps)
 
-        # Step 0f: Pre-assess gap flanks
+        # Step 0e: Pre-assess gap flanks
         polished_file = self.output_dir / "assembly_polished.fasta"
         polishing_occurred = False
 
         if not _is_done(preprocess_dir, "polish"):
-            self.logger.info("STEP 0f: Pre-assessing gap flanks...")
+            self.logger.info("STEP 0e: Pre-assessing gap flanks...")
             gaps = self._find_gaps(current_assembly)
             gaps_needing_polish = self._pre_assess_gaps(gaps, hifi_bam, ont_bam)
 
-            # Step 0g: Polish problematic flanks
+            # Step 0f: Polish problematic flanks
             if gaps_needing_polish:
-                self.logger.info(f"STEP 0g: Polishing {len(gaps_needing_polish)} gap flanks...")
+                self.logger.info(f"STEP 0f: Polishing {len(gaps_needing_polish)} gap flanks...")
                 polished_assembly = self._polish_gap_flanks(
                     current_assembly, gaps_needing_polish, hifi_bam, ont_bam, preprocess_dir
                 )
@@ -783,7 +723,7 @@ class HaploidEngine:
 
             _mark_done(preprocess_dir, "polish")
         else:
-            self.logger.info("STEP 0f-0g: Polish already done")
+            self.logger.info("STEP 0e-0f: Polish already done")
             if polished_file.exists():
                 current_assembly = polished_file
                 polishing_occurred = True
@@ -1112,34 +1052,6 @@ class HaploidEngine:
                     f.write(seq[i:i+80] + '\n')
 
         return reverted_assembly
-
-    def _prepare_hic_data(self, assembly: Path):
-        """Prepare Hi-C BAM file and analyzer"""
-        hic_bam_path = self.hic_bam
-
-        # Align Hi-C reads if BAM not provided
-        if not hic_bam_path and self.hic_reads:
-            hic_bam_path = self.output_dir / "hic_aligned.bam"
-            if not hic_bam_path.exists():
-                self.logger.info("  Aligning Hi-C reads...")
-                align_hic_reads(
-                    self.hic_reads[0],
-                    self.hic_reads[1],
-                    str(assembly),
-                    str(hic_bam_path),
-                    threads=self.threads
-                )
-
-        # Initialize analyzer
-        if hic_bam_path and hic_bam_path.exists():
-            self.hic_analyzer = HiCAnalyzer(
-                hic_bam=str(hic_bam_path),
-                assembly_file=str(assembly),
-                threads=self.threads
-            )
-            self.logger.info(f"  Hi-C analyzer ready: {hic_bam_path}")
-        else:
-            self.logger.warning("  Hi-C BAM not available")
 
     def _find_gaps(self, assembly_file: Path) -> List[Dict]:
         """Find gaps (N-runs) in assembly, with caching"""

@@ -38,7 +38,6 @@ from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 
 from gapfill.core.filler import GapFiller
-from gapfill.utils.hic import HiCAnalyzer, align_hic_reads
 # Import ReadPhaser from polyploid module (with alignment-based SNP detection)
 from gapfill.engines.polyploid import ReadPhaser
 from gapfill.engines.haploid import _mark_done, _is_done, _clear_marker
@@ -63,8 +62,6 @@ class OptimizedPolyploidEngine:
                  haplotype_assemblies: List[str],
                  hifi_reads: Optional[str] = None,
                  ont_reads: Optional[str] = None,
-                 hic_reads: Optional[List[str]] = None,
-                 hic_bam: Optional[str] = None,
                  output_dir: str = "polyploid_output",
                  threads: int = 8,
                  max_iterations: int = 10,
@@ -79,8 +76,6 @@ class OptimizedPolyploidEngine:
         self.num_haplotypes = len(self.haplotypes)
         self.hifi_reads = Path(hifi_reads) if hifi_reads else None
         self.ont_reads = Path(ont_reads) if ont_reads else None
-        self.hic_reads = hic_reads
-        self.hic_bam = Path(hic_bam) if hic_bam else None
         self.output_dir = Path(output_dir)
         self.threads = threads
         self.max_iterations = max_iterations
@@ -98,9 +93,6 @@ class OptimizedPolyploidEngine:
         self.checkpoint = PolyploidCheckpointManager(str(self.output_dir), self.hap_names)
         if clear_checkpoint:
             self.checkpoint.clear()
-
-        self.hic_analyzer: Optional[HiCAnalyzer] = None
-        self.hic_analyzers: Dict[str, HiCAnalyzer] = {}  # Per-haplotype analyzers
 
         # Store normalized assemblies
         self.normalized_assemblies: Dict[str, Path] = {}
@@ -206,14 +198,9 @@ class OptimizedPolyploidEngine:
         ref_hap = self.hap_names[0]
         ref_assembly = self.normalized_assemblies[ref_hap]
 
-        # Prepare Hi-C data if available (using merged reference)
-        if self.hic_reads or self.hic_bam:
-            self.logger.info("STEP 0b: Preparing Hi-C data (merged reference)")
-            self._prepare_hic_data()
-
-        # Step 0c: Filter reads (OPTIMIZATION - keep only gap-related reads)
+        # Step 0b: Filter reads (OPTIMIZATION - keep only gap-related reads)
         if self.filter_reads and self.reads_cache:
-            self.logger.info("STEP 0c: Filtering reads (keeping gap-related reads only)...")
+            self.logger.info("STEP 0b: Filtering reads (keeping gap-related reads only)...")
 
             # Collect all gaps from all haplotypes
             all_gaps = []
@@ -492,16 +479,12 @@ class OptimizedPolyploidEngine:
                     current_assemblies[hap_name], hap_name, hap_dir
                 )
 
-                # Get Hi-C analyzer for this haplotype (if available)
-                hap_hic_analyzer = self.hic_analyzers.get(hap_name)
-
                 filler = GapFiller(
                     assembly_file=str(hap_assembly),
                     hifi_bam=str(hap_hifi_bam) if hap_hifi_bam else None,
                     ont_bam=str(hap_ont_bam) if hap_ont_bam else None,
                     threads=self.threads,
-                    work_dir=str(work_dir),
-                    hic_analyzer=hap_hic_analyzer
+                    work_dir=str(work_dir)
                 )
 
                 # Fill gaps
@@ -793,155 +776,3 @@ class OptimizedPolyploidEngine:
 
         with open(self.output_dir / "summary.json", 'w') as f:
             json.dump(summary, f, indent=2)
-
-    def _prepare_hic_data(self):
-        """
-        Prepare Hi-C BAM files for all haplotypes using merged reference alignment.
-
-        Strategy:
-        1. Create merged reference with all haplotypes (hap1__Chr1, hap2__Chr1, ...)
-        2. Align Hi-C reads once to merged reference
-        3. Split BAM by haplotype prefix
-        4. Create per-haplotype HiCAnalyzer
-        """
-        # Check if user provided pre-aligned BAM
-        if self.hic_bam:
-            # User provided BAM - assume it's aligned to first haplotype (backward compatible)
-            self.logger.info("  Using provided Hi-C BAM (aligned to single haplotype)")
-            ref_assembly = self.normalized_assemblies[self.hap_names[0]]
-            self.hic_analyzer = HiCAnalyzer(
-                hic_bam=str(self.hic_bam),
-                assembly_file=str(ref_assembly),
-                threads=self.threads
-            )
-            # Use same analyzer for all haplotypes
-            for hap_name in self.hap_names:
-                self.hic_analyzers[hap_name] = self.hic_analyzer
-            return
-
-        if not self.hic_reads:
-            self.logger.warning("  No Hi-C data provided")
-            return
-
-        # Step 1: Create merged reference
-        self.logger.info("  Creating merged reference for Hi-C alignment...")
-        merged_ref = self._create_merged_hic_reference()
-
-        # Step 2: Align Hi-C to merged reference
-        merged_hic_bam = self.output_dir / "hic_merged_aligned.bam"
-        if not merged_hic_bam.exists():
-            self.logger.info("  Aligning Hi-C reads to merged reference...")
-            align_hic_reads(
-                self.hic_reads[0],
-                self.hic_reads[1],
-                str(merged_ref),
-                str(merged_hic_bam),
-                threads=self.threads
-            )
-        else:
-            self.logger.info(f"  Reusing existing Hi-C BAM: {merged_hic_bam}")
-
-        # Step 3: Split BAM by haplotype
-        self.logger.info("  Splitting Hi-C BAM by haplotype...")
-        for hap_name in self.hap_names:
-            hap_hic_bam = self.output_dir / f"hic_{hap_name}.bam"
-            hap_assembly = self.normalized_assemblies[hap_name]
-
-            if not hap_hic_bam.exists():
-                self._split_hic_bam_by_haplotype(merged_hic_bam, hap_hic_bam, hap_name)
-
-            # Step 4: Create analyzer for this haplotype
-            if hap_hic_bam.exists() and hap_hic_bam.stat().st_size > 0:
-                self.hic_analyzers[hap_name] = HiCAnalyzer(
-                    hic_bam=str(hap_hic_bam),
-                    assembly_file=str(hap_assembly),
-                    threads=self.threads
-                )
-                self.logger.info(f"    {hap_name}: Hi-C analyzer ready")
-
-        # Set default analyzer to hap1 for backward compatibility
-        if self.hap_names[0] in self.hic_analyzers:
-            self.hic_analyzer = self.hic_analyzers[self.hap_names[0]]
-
-        self.logger.info(f"  Hi-C analyzers ready for {len(self.hic_analyzers)} haplotypes")
-
-    def _create_merged_hic_reference(self) -> Path:
-        """Create merged reference with haplotype prefixes for Hi-C alignment"""
-        merged_ref = self.output_dir / "hic_merged_reference.fasta"
-
-        if merged_ref.exists():
-            return merged_ref
-
-        with open(merged_ref, 'w') as out:
-            for hap_name in self.hap_names:
-                hap_file = self.normalized_assemblies[hap_name]
-                for record in SeqIO.parse(hap_file, 'fasta'):
-                    # Add haplotype prefix: hap1__Chr1
-                    new_id = f"{hap_name}__{record.id}"
-                    out.write(f">{new_id}\n")
-                    seq = str(record.seq)
-                    for i in range(0, len(seq), 80):
-                        out.write(seq[i:i+80] + '\n')
-
-        self.logger.info(f"    Created merged reference: {merged_ref}")
-        return merged_ref
-
-    def _split_hic_bam_by_haplotype(self, input_bam: Path, output_bam: Path, hap_name: str):
-        """
-        Split Hi-C BAM to only include alignments to specific haplotype.
-        Also removes haplotype prefix from contig names.
-        """
-        prefix = f"{hap_name}__"
-
-        with pysam.AlignmentFile(str(input_bam), 'rb') as inp:
-            # Find contigs for this haplotype
-            contigs = [ref for ref in inp.references if ref.startswith(prefix)]
-
-            if not contigs:
-                self.logger.warning(f"    No contigs found for {hap_name}")
-                # Create empty BAM
-                with pysam.AlignmentFile(str(output_bam), 'wb', template=inp) as out:
-                    pass
-                return
-
-            # Create new header without prefix
-            new_header = inp.header.to_dict()
-            new_refs = []
-            for sq in new_header.get('SQ', []):
-                if sq['SN'].startswith(prefix):
-                    sq['SN'] = sq['SN'][len(prefix):]
-                    new_refs.append(sq)
-            new_header['SQ'] = new_refs
-
-            with pysam.AlignmentFile(str(output_bam), 'wb', header=new_header) as out:
-                for contig in contigs:
-                    for read in inp.fetch(contig):
-                        # Create new alignment with renamed reference
-                        a = pysam.AlignedSegment()
-                        a.query_name = read.query_name
-                        a.query_sequence = read.query_sequence
-                        a.flag = read.flag
-                        a.reference_id = out.get_tid(contig[len(prefix):])
-                        a.reference_start = read.reference_start
-                        a.mapping_quality = read.mapping_quality
-                        a.cigar = read.cigar
-                        a.query_qualities = read.query_qualities
-
-                        # Handle mate information
-                        if read.is_paired and not read.mate_is_unmapped:
-                            mate_ref = read.next_reference_name
-                            if mate_ref and mate_ref.startswith(prefix):
-                                a.next_reference_id = out.get_tid(mate_ref[len(prefix):])
-                                a.next_reference_start = read.next_reference_start
-                            else:
-                                # Mate on different haplotype - mark as unmapped mate
-                                a.flag |= 0x8  # mate unmapped
-                                a.next_reference_id = -1
-                                a.next_reference_start = 0
-
-                        if a.reference_id >= 0:
-                            out.write(a)
-
-        # Index the output BAM
-        pysam.index(str(output_bam))
-        self.logger.info(f"    Split BAM for {hap_name}: {output_bam}")

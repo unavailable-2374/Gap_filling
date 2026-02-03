@@ -12,9 +12,6 @@ python -m gapfill -a hap1.fa hap2.fa --hifi hifi.fq --ont ont.fq -o output
 # 多倍体 + 优化模式 (减少75%比对)
 python -m gapfill -a hap1.fa hap2.fa --hifi hifi.fq --optimized -o output
 
-# 使用 Hi-C 数据
-python -m gapfill -a assembly.fa --hifi hifi.fq --hic hic_R1.fq hic_R2.fq -o output
-
 # 断点续跑 (中断后恢复)
 python -m gapfill -a assembly.fa --hifi hifi.fq -o output --resume
 
@@ -173,7 +170,6 @@ gapfill/
     ├── indexer.py            # AssemblyIndexer
     ├── scanner.py            # GapScanner
     ├── tempfiles.py          # TempFileManager
-    ├── hic.py                # HiCAnalyzer - Hi-C 数据分析
     ├── checkpoint.py         # CheckpointManager - 断点续跑
     └── reads_cache.py        # ReadsCache - reads过滤与缓存
 ```
@@ -187,14 +183,13 @@ gapfill/
 │  PREPROCESSING PHASE (一次性，在迭代前)                          │
 ├─────────────────────────────────────────────────────────────────┤
 │  0a. Find initial gaps                                          │
-│  0b. Prepare Hi-C data (optional)                               │
-│  0c. Normalize gaps → 500N                                      │
-│  0d. Initial alignment → BAM                                    │
-│  0e. [优化] Filter reads → 过滤锚定在非gap区域的reads           │
-│  0f. Pre-assess gap flanks                                      │
+│  0b. Normalize gaps → 500N                                      │
+│  0c. Initial alignment → BAM                                    │
+│  0d. [优化] Filter reads → 过滤锚定在非gap区域的reads           │
+│  0e. Pre-assess gap flanks                                      │
 │      ├─ PENDING: 侧翼正常                                       │
 │      └─ NEEDS_POLISH: 侧翼有问题                                │
-│  0g. Polish problematic flanks → polished assembly              │
+│  0f. Polish problematic flanks → polished assembly              │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
@@ -224,8 +219,7 @@ gapfill/
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  STEP 0: Normalize ALL haplotypes → 500N                        │
-│  STEP 0b: Prepare Hi-C data (optional)                          │
-│  STEP 0c: [优化] Filter reads                                   │
+│  STEP 0b: [优化] Filter reads                                   │
 │      ├─ 全量比对一次到 ref_haplotype                            │
 │      └─ 过滤掉锚定在非gap区域的reads                            │
 │  STEP 1: SNP detection (alignment-based)                        │
@@ -380,25 +374,7 @@ class PendingFill:
 - Clip accumulation: ≥5 reads 在同一位置 clip
 - High mismatch density: > 5% 错配率
 
-### 4. Hi-C 数据整合 (utils/hic.py)
-
-| 阶段 | Hi-C 作用 | 方法 |
-|------|----------|------|
-| **填充前** | 估计 gap 真实大小 | `estimate_gap_sizes()` |
-| **填充中** | 指导 wtdbg2 -g 参数 | `gap_size_estimates` |
-| **填充中** | 多候选序列选择 | `_select_best_candidate_with_hic()` |
-| **填充后** | 验证填充正确性 | `validate_fills()` |
-| **Phasing** | 增强 reads 分配 | `enhance_phasing()` |
-
-**多倍体 Hi-C 合并参考比对：**
-```
-1. 创建合并参考 (hap1__Chr1, hap2__Chr1, hap3__Chr1, ...)
-2. Hi-C 比对一次到合并参考
-3. 按前缀分流 BAM 到各 haplotype
-4. 每个 haplotype 获得独立的 HiCAnalyzer
-```
-
-### 5. 多倍体 SNP 检测 (engines/polyploid.py)
+### 4. 多倍体 SNP 检测 (engines/polyploid.py)
 
 **流程：**
 ```
@@ -413,7 +389,7 @@ STEP 3: Gap filling (skip_normalization=True)
 - `ReadPhaser._detect_snps_alignment()` - alignment-based SNP 检测
 - `ReadPhaser._assign_read_to_haplotype_detailed()` - SNP-based 分配
 
-### 6. 断点续跑 (.ok 文件机制)
+### 5. 断点续跑 (.ok 文件机制)
 
 **使用方法：**
 ```bash
@@ -437,7 +413,6 @@ output/
 ├── preprocessing/
 │   ├── alignment.ok           # 初始比对完成
 │   ├── filter.ok              # reads 过滤完成
-│   ├── hic.ok                 # Hi-C 准备完成
 │   └── polish.ok              # flank polish 完成
 ├── iteration_1/
 │   ├── alignment.ok           # 比对完成
@@ -468,8 +443,6 @@ output/
 -a, --assembly FILE(s)    # 1个=单倍体，2+个=多倍体
 --hifi FILE               # HiFi reads
 --ont FILE                # ONT reads
---hic R1 R2               # Hi-C paired-end reads
---hic-bam FILE            # 预比对的 Hi-C BAM
 -o, --output DIR          # 输出目录
 -t, --threads N           # 线程数 (default: 8)
 --max-iterations N        # 最大迭代 (default: 10)
@@ -529,7 +502,7 @@ output/
 | `-L` | 1000 | 2000 | 最小读长 |
 | `-e` | 2 | 2 | 边缘覆盖度阈值 |
 | `-S` | 1 | 1 | 救回低覆盖度边缘 |
-| `-g` | auto | auto | 基于 reads 或 Hi-C 估计 |
+| `-g` | auto | auto | 基于 reads 统计估计 |
 
 ### minimap2 (比对)
 
@@ -562,5 +535,4 @@ samtools sort -@ {threads} -m 2G -o {output} -
 **External:**
 - minimap2, samtools, wtdbg2, wtpoa-cns
 - racon (Polish 功能)
-- bwa-mem2 (Hi-C 比对)
 - bcftools, whatshap (多倍体 whatshap 模式)
