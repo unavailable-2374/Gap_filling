@@ -100,6 +100,11 @@ class GapValidator:
         self.logger = logging.getLogger(__name__)
         self._bam_handles: Dict[str, pysam.AlignmentFile] = {}
 
+    # Thresholds for junction and coverage validation
+    MIN_JUNCTION_COVERAGE = 5    # Minimum coverage at junction points
+    MIN_INSERT_COVERAGE = 5      # Minimum average coverage for inserted sequence
+    MAX_COVERAGE_GAP_RATIO = 0.05  # Maximum ratio of zero-coverage positions (5%)
+
     def validate_complete_fill(
         self,
         bam_file: str,
@@ -109,18 +114,14 @@ class GapValidator:
         filled_sequence: str
     ) -> ValidationResult:
         """
-        Validate a completely filled gap
+        Validate a completely filled gap.
 
-        Validation strategy adapts to fill size:
-        - Small fills (<2kb): Require spanning reads + coverage
-        - Large fills (>=2kb): Focus on coverage continuity + boundary evidence
+        Complete fills require spanning reads to confirm the fill bridges
+        the original gap correctly.
 
         Criteria:
-        1. Coverage is continuous (limited zero-coverage regions)
+        1. Has spanning reads (reads that span the entire filled region)
         2. Coverage level is adequate
-        3. For small fills: require spanning reads
-        4. For large fills: require boundary-crossing reads
-        5. Junctions should be clean (low clip ratio)
         """
         fill_length = gap_end - gap_start
         bam = self._get_bam(bam_file)
@@ -134,59 +135,22 @@ class GapValidator:
         # Collect alignment statistics
         stats = self._analyze_region(bam, chrom, gap_start, gap_end)
 
-        # Validation checks
         issues = []
-        warnings = []  # Non-fatal issues
 
-        # Adapt validation based on fill size
-        is_large_fill = fill_length >= 2000
+        # Complete fills: REQUIRE spanning reads
+        min_spanning = (self.MIN_SPANNING_READS_SHORT
+                       if fill_length < 1000
+                       else self.MIN_SPANNING_READS_LONG)
+        if stats['spanning_reads'] < min_spanning:
+            issues.append(f"Insufficient spanning reads: {stats['spanning_reads']} < {min_spanning}")
 
-        # Check 1: Coverage continuity (required for all)
-        max_zero_ratio = 0.10 if is_large_fill else self.MAX_ZERO_COVERAGE_RATIO
-        if stats['zero_coverage_ratio'] > max_zero_ratio:
-            issues.append(f"Coverage gaps: {stats['zero_coverage_ratio']*100:.1f}% zero coverage")
-
-        # Check 2: Average coverage (required for all)
+        # Also check basic coverage
         if stats['avg_coverage'] < self.MIN_AVG_COVERAGE:
             issues.append(f"Low coverage: {stats['avg_coverage']:.1f}x < {self.MIN_AVG_COVERAGE}x")
-
-        # Check 3: Spanning reads (strict for small fills, relaxed for large)
-        if is_large_fill:
-            # For large fills, spanning reads are rare - check boundary crossings instead
-            min_boundary_reads = 1
-            if (stats['left_boundary_reads'] < min_boundary_reads and
-                stats['right_boundary_reads'] < min_boundary_reads):
-                # No boundary evidence at all
-                if stats['spanning_reads'] == 0:
-                    issues.append(f"No spanning or boundary reads")
-            elif stats['spanning_reads'] == 0:
-                # Have boundary reads but no spanning - acceptable for large fills
-                warnings.append(f"No spanning reads (boundary reads: L={stats['left_boundary_reads']}, R={stats['right_boundary_reads']})")
-        else:
-            # For small fills, require spanning reads
-            min_spanning = (self.MIN_SPANNING_READS_SHORT
-                           if fill_length < 1000
-                           else self.MIN_SPANNING_READS_LONG)
-            if stats['spanning_reads'] < min_spanning:
-                issues.append(f"Insufficient spanning reads: {stats['spanning_reads']} < {min_spanning}")
-
-        # Check 4: Junction quality (warning for high clips)
-        if stats['left_clip_ratio'] > self.MAX_JUNCTION_CLIP_RATIO:
-            warnings.append(f"Left junction clips: {stats['left_clip_ratio']*100:.1f}%")
-        if stats['right_clip_ratio'] > self.MAX_JUNCTION_CLIP_RATIO:
-            warnings.append(f"Right junction clips: {stats['right_clip_ratio']*100:.1f}%")
-
-        # Junction clips are only fatal if coverage is also problematic
-        if (stats['left_clip_ratio'] > 0.5 or stats['right_clip_ratio'] > 0.5):
-            if stats['avg_coverage'] < 5.0:
-                issues.append(f"High junction clips with low coverage")
 
         # Determine result
         valid = len(issues) == 0
         confidence = self._calculate_confidence(stats, fill_length, is_complete=True)
-
-        reason_parts = issues + warnings if not valid else warnings
-        reason = "; ".join(reason_parts) if reason_parts else "Validation passed"
 
         return ValidationResult(
             valid=valid,
@@ -200,7 +164,7 @@ class GapValidator:
             right_boundary_reads=stats['right_boundary_reads'],
             left_clip_ratio=stats['left_clip_ratio'],
             right_clip_ratio=stats['right_clip_ratio'],
-            reason=reason
+            reason="; ".join(issues) if issues else "Validation passed"
         )
 
     def validate_partial_fill(
@@ -214,12 +178,15 @@ class GapValidator:
         new_gap_end: int
     ) -> ValidationResult:
         """
-        Validate a partially filled gap
+        Validate a partially filled gap.
+
+        Partial fills are validated by checking junctions and coverage,
+        NOT by requiring spanning reads.
 
         Criteria:
-        1. Filled portion has coverage
-        2. New boundary has read evidence (reads terminating there)
-        3. Filled portion coverage is reasonable
+        1. Junction coverage >= 5 (where fill meets original sequence)
+        2. Average coverage of inserted sequence >= 5
+        3. No coverage breakpoints in inserted sequence (zero_cov_ratio < 5%)
         """
         bam = self._get_bam(bam_file)
         if bam is None:
@@ -229,54 +196,117 @@ class GapValidator:
                 reason="Cannot open BAM file"
             )
 
-        # Determine which side was filled
-        left_filled = new_gap_start > original_gap_start
-        right_filled = new_gap_end < original_gap_end
-
         issues = []
+        all_stats = []
 
-        # Analyze filled portions
-        if left_filled:
-            left_stats = self._analyze_region(
-                bam, chrom, original_gap_start, new_gap_start
-            )
-            if left_stats['avg_coverage'] < self.MIN_AVG_COVERAGE:
-                issues.append(f"Left fill low coverage: {left_stats['avg_coverage']:.1f}x")
-            if left_stats['zero_coverage_ratio'] > self.MAX_ZERO_COVERAGE_RATIO_PARTIAL:
-                issues.append(f"Left fill has coverage gaps")
-            # Check for reads terminating at new boundary (expected for partial)
-            if left_stats['right_boundary_reads'] < 1:
-                issues.append("No reads at new left boundary")
+        # The filled region is from original_gap_start to original_gap_end
+        # (the entire region that was replaced, including the new 500N placeholder)
+        # We need to check:
+        # 1. Left junction: original_gap_start (where fill meets left flank)
+        # 2. Right junction: original_gap_end in new coords (where fill meets right flank)
+        # 3. Inserted sequence coverage (excluding the 500N placeholder)
 
-        if right_filled:
-            right_stats = self._analyze_region(
-                bam, chrom, new_gap_end, original_gap_end
+        # Determine filled portions
+        # new_gap_start/end are where the 500N placeholder is in the filled sequence
+        left_fill_length = new_gap_start - original_gap_start  # Left inserted portion
+        right_fill_length = original_gap_end - new_gap_end     # Right inserted portion
+
+        # Check left junction and left inserted sequence
+        if left_fill_length > 0:
+            # Left junction coverage
+            left_junction_cov = self._get_junction_coverage(
+                bam, chrom, original_gap_start, window=50
             )
-            if right_stats['avg_coverage'] < self.MIN_AVG_COVERAGE:
-                issues.append(f"Right fill low coverage: {right_stats['avg_coverage']:.1f}x")
-            if right_stats['zero_coverage_ratio'] > self.MAX_ZERO_COVERAGE_RATIO_PARTIAL:
-                issues.append("Right fill has coverage gaps")
-            if right_stats['left_boundary_reads'] < 1:
-                issues.append("No reads at new right boundary")
+            if left_junction_cov < self.MIN_JUNCTION_COVERAGE:
+                issues.append(f"Left junction low coverage: {left_junction_cov:.1f}x < {self.MIN_JUNCTION_COVERAGE}")
+
+            # Left inserted sequence
+            left_stats = self._analyze_region(bam, chrom, original_gap_start, new_gap_start)
+            all_stats.append(left_stats)
+
+            if left_stats['avg_coverage'] < self.MIN_INSERT_COVERAGE:
+                issues.append(f"Left insert low coverage: {left_stats['avg_coverage']:.1f}x < {self.MIN_INSERT_COVERAGE}")
+            if left_stats['zero_coverage_ratio'] > self.MAX_COVERAGE_GAP_RATIO:
+                issues.append(f"Left insert has coverage gaps: {left_stats['zero_coverage_ratio']*100:.1f}%")
+
+        # Check right junction and right inserted sequence
+        if right_fill_length > 0:
+            # Right junction coverage (at the end of the fill, before right flank)
+            # In new assembly, right flank starts at: original_gap_start + len(filled_sequence) - (original_gap_end - original_gap_start) + (original_gap_end - new_gap_end)
+            # Simplified: we check coverage at new_gap_end (end of 500N placeholder)
+            right_junction_cov = self._get_junction_coverage(
+                bam, chrom, new_gap_end + right_fill_length, window=50
+            )
+            if right_junction_cov < self.MIN_JUNCTION_COVERAGE:
+                issues.append(f"Right junction low coverage: {right_junction_cov:.1f}x < {self.MIN_JUNCTION_COVERAGE}")
+
+            # Right inserted sequence
+            right_stats = self._analyze_region(bam, chrom, new_gap_end, new_gap_end + right_fill_length)
+            all_stats.append(right_stats)
+
+            if right_stats['avg_coverage'] < self.MIN_INSERT_COVERAGE:
+                issues.append(f"Right insert low coverage: {right_stats['avg_coverage']:.1f}x < {self.MIN_INSERT_COVERAGE}")
+            if right_stats['zero_coverage_ratio'] > self.MAX_COVERAGE_GAP_RATIO:
+                issues.append(f"Right insert has coverage gaps: {right_stats['zero_coverage_ratio']*100:.1f}%")
 
         valid = len(issues) == 0
 
         # Combined stats
         avg_cov = 0
-        if left_filled and right_filled:
-            avg_cov = (left_stats['avg_coverage'] + right_stats['avg_coverage']) / 2
-        elif left_filled:
-            avg_cov = left_stats['avg_coverage']
-        elif right_filled:
-            avg_cov = right_stats['avg_coverage']
+        zero_ratio = 0
+        if all_stats:
+            avg_cov = sum(s['avg_coverage'] for s in all_stats) / len(all_stats)
+            zero_ratio = sum(s['zero_coverage_ratio'] for s in all_stats) / len(all_stats)
 
         return ValidationResult(
             valid=valid,
             status=GapStatus.FILLED_PARTIAL if valid else GapStatus.FAILED,
-            confidence=0.7 if valid else 0.3,  # Partial fills have lower base confidence
+            confidence=0.8 if valid else 0.3,
             avg_coverage=avg_cov,
+            zero_coverage_ratio=zero_ratio,
             reason="; ".join(issues) if issues else "Partial fill validated"
         )
+
+    def _get_junction_coverage(self, bam: pysam.AlignmentFile, chrom: str,
+                                position: int, window: int = 50) -> float:
+        """
+        Get average coverage at a junction point.
+
+        Args:
+            bam: BAM file handle
+            chrom: Chromosome name
+            position: Junction position
+            window: Window size around junction (default 50bp each side)
+
+        Returns:
+            Average coverage at the junction
+        """
+        start = max(0, position - window)
+        end = position + window
+
+        try:
+            coverage = np.zeros(end - start, dtype=np.uint16)
+
+            for read in bam.fetch(chrom, start, end):
+                if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                    continue
+
+                read_start = read.reference_start
+                read_end = read.reference_end
+
+                if read_start is None or read_end is None:
+                    continue
+
+                cov_start = max(0, read_start - start)
+                cov_end = min(len(coverage), read_end - start)
+                if cov_start < cov_end:
+                    coverage[cov_start:cov_end] += 1
+
+            return float(np.mean(coverage))
+
+        except Exception as e:
+            self.logger.warning(f"Error getting junction coverage at {chrom}:{position}: {e}")
+            return 0.0
 
     def analyze_failed_gap(
         self,

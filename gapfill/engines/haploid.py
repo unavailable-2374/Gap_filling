@@ -719,18 +719,36 @@ class HaploidEngine:
             for gap_id, pf in pending_fills.items():
                 self.logger.info(f"    Validating {gap_id}...")
 
-                # Validate the filled region
-                if pf.is_complete:
-                    result = validator.validate_complete_fill(
-                        bam_file, pf.chrom, pf.filled_start, pf.filled_end, pf.sequence
-                    )
-                else:
-                    # For partial fills, just check basic coverage
-                    result = validator.validate_complete_fill(
-                        bam_file, pf.chrom, pf.filled_start, pf.filled_end, pf.sequence
-                    )
-
                 fill_length = pf.filled_end - pf.filled_start
+
+                # Validate based on fill type
+                if pf.is_complete:
+                    # Complete fills: require spanning reads
+                    result = validator.validate_complete_fill(
+                        bam_file, pf.chrom, pf.filled_start, pf.filled_end, pf.sequence
+                    )
+                    self.logger.debug(f"      Complete fill validation: spanning={result.spanning_reads}")
+                else:
+                    # Partial fills: check junctions and coverage only
+                    # Find the 500N placeholder in the sequence
+                    n_match = re.search(r'N{100,}', pf.sequence)
+                    if n_match:
+                        # Calculate new gap position in assembly coordinates
+                        new_gap_start = pf.filled_start + n_match.start()
+                        new_gap_end = pf.filled_start + n_match.end()
+
+                        result = validator.validate_partial_fill(
+                            bam_file, pf.chrom,
+                            pf.original_start, pf.original_end,
+                            pf.sequence,
+                            new_gap_start, new_gap_end
+                        )
+                        self.logger.debug(f"      Partial fill validation: junction/coverage based")
+                    else:
+                        # No N-run found but marked as partial - treat as complete
+                        result = validator.validate_complete_fill(
+                            bam_file, pf.chrom, pf.filled_start, pf.filled_end, pf.sequence
+                        )
 
                 if result.valid:
                     validated_count += 1
@@ -738,22 +756,21 @@ class HaploidEngine:
                         self.gap_tracker.set_status(gap_id, GapStatus.FILLED_COMPLETE,
                                                    f"Validated: {result.reason}")
                         self.checkpoint.add_completed_gap(gap_id, pf.sequence)
+                        self.logger.info(f"      ✓ Validated {fill_length}bp complete fill "
+                                       f"(cov={result.avg_coverage:.1f}x, spanning={result.spanning_reads})")
                     else:
                         self.gap_tracker.set_status(gap_id, GapStatus.FILLED_PARTIAL,
                                                    f"Validated: {result.reason}")
                         self.checkpoint.add_partial_gap(gap_id, pf.sequence)
-
-                    self.logger.info(f"      ✓ Validated {fill_length}bp fill "
-                                   f"(cov={result.avg_coverage:.1f}x, spanning={result.spanning_reads}, "
-                                   f"boundary L/R={result.left_boundary_reads}/{result.right_boundary_reads})")
+                        self.logger.info(f"      ✓ Validated {fill_length}bp partial fill "
+                                       f"(cov={result.avg_coverage:.1f}x)")
                 else:
                     failed_count += 1
                     fills_to_revert.append(pf)
                     self.gap_tracker.set_status(gap_id, GapStatus.FAILED,
                                                f"Validation failed: {result.reason}")
                     self.logger.warning(f"      ✗ Failed {fill_length}bp fill: {result.reason} "
-                                       f"(cov={result.avg_coverage:.1f}x, spanning={result.spanning_reads}, "
-                                       f"zero_cov={result.zero_coverage_ratio*100:.1f}%)")
+                                       f"(cov={result.avg_coverage:.1f}x, zero_cov={result.zero_coverage_ratio*100:.1f}%)")
 
         finally:
             validator.close()
