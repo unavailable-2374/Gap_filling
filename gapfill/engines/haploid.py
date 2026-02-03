@@ -251,6 +251,7 @@ class HaploidEngine:
                 break
 
             # Step 2: Validate previous iteration's fills (if any)
+            assembly_before_validation = current_assembly
             if iteration > 1:
                 pending_fills = self.gap_tracker.get_pending_fills()
                 if pending_fills:
@@ -258,6 +259,14 @@ class HaploidEngine:
                     current_assembly = self._validate_previous_fills(
                         current_assembly, pending_fills, hifi_bam, ont_bam, iter_dir
                     )
+
+                    # If assembly changed (reverts occurred), re-align reads
+                    if current_assembly != assembly_before_validation:
+                        self.logger.info("Step 2b: Re-aligning reads to reverted assembly...")
+                        if self.optimized_mode and self.reads_cache:
+                            hifi_bam, ont_bam = self._align_filtered_reads(current_assembly, iter_dir)
+                        else:
+                            hifi_bam, ont_bam = self._align_reads_with_cache(current_assembly, iter_dir)
 
             # Step 3: Find gaps
             self.logger.info("Step 3: Finding gaps...")
