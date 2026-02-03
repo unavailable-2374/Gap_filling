@@ -41,6 +41,7 @@ from gapfill.core.filler import GapFiller
 from gapfill.utils.hic import HiCAnalyzer, align_hic_reads
 # Import ReadPhaser from polyploid module (with alignment-based SNP detection)
 from gapfill.engines.polyploid import ReadPhaser
+from gapfill.engines.haploid import _mark_done, _is_done, _clear_marker
 from gapfill.utils.checkpoint import PolyploidCheckpointManager, CheckpointState
 from gapfill.utils.reads_cache import ReadsCache
 
@@ -180,34 +181,21 @@ class OptimizedPolyploidEngine:
                             min_read_snps=self.min_read_snps, work_dir=self.output_dir)
 
         # STEP 0: Normalize gaps in ALL haplotypes FIRST
-        skip_normalization = False
-        if self.resume and checkpoint_state.phase in ('phasing', 'filling', 'complete'):
-            # Check if normalized assemblies exist
-            all_normalized_exist = True
+        if _is_done(self.output_dir, "normalized"):
+            self.logger.info("STEP 0: Reusing normalized assemblies")
             for hap_name in self.hap_names:
                 normalized_file = self.output_dir / f"{hap_name}_normalized.fasta"
-                if not normalized_file.exists():
-                    all_normalized_exist = False
-                    break
                 self.normalized_assemblies[hap_name] = normalized_file
-
-            if all_normalized_exist:
-                self.logger.info("STEP 0: Reusing normalized assemblies from checkpoint")
-                skip_normalization = True
-                # Re-scan gaps for phaser
-                for hap_name in self.hap_names:
-                    phaser.normalized_assemblies[hap_name] = self.normalized_assemblies[hap_name]
-                    phaser.gap_regions[hap_name] = phaser._find_gaps(
-                        self.normalized_assemblies[hap_name], self.min_gap_size
-                    )
-
-        if not skip_normalization:
+                phaser.normalized_assemblies[hap_name] = normalized_file
+                phaser.gap_regions[hap_name] = phaser._find_gaps(
+                    normalized_file, self.min_gap_size
+                )
+        else:
             self.logger.info("STEP 0: Normalizing gaps in all haplotypes")
             self.normalized_assemblies = phaser.normalize_all_assemblies(
                 min_gap_size=self.min_gap_size
             )
-            checkpoint_state.phase = "normalization"
-            self.checkpoint.save(checkpoint_state)
+            _mark_done(self.output_dir, "normalized")
 
         # Report haplotype-specific gaps
         for hap_name, specific_gaps in phaser.haplotype_specific_gaps.items():
@@ -301,45 +289,38 @@ class OptimizedPolyploidEngine:
                                f"({cache_summary['ont']['stats']['kept_ratio']*100:.1f}%)")
 
         # Detect SNPs using alignment-based method
-        snp_db = None
-        skip_snp_detection = False
-
-        if self.resume and checkpoint_state.phase in ('phasing', 'filling', 'complete'):
-            existing_snp_db = self.checkpoint.get_snp_database()
-            if existing_snp_db:
-                self.logger.info(f"STEP 1: Reusing SNP database from checkpoint")
-                snp_db = self._load_snp_db(existing_snp_db)
-                skip_snp_detection = True
-
-        if not skip_snp_detection:
+        snp_file = self.output_dir / "snp_database.json"
+        if _is_done(self.output_dir, "snp_detection") and snp_file.exists():
+            self.logger.info("STEP 1: Reusing SNP database")
+            snp_db = self._load_snp_db(snp_file)
+        else:
             self.logger.info("STEP 1: Detecting haplotype-specific SNPs (alignment-based)")
             snp_db = phaser.detect_haplotype_snps()
-
-            # Save SNP database
-            snp_file = self.output_dir / "snp_database.json"
             self._save_snp_db(snp_db, snp_file)
-            self.checkpoint.set_snp_database(str(snp_file))
+            _mark_done(self.output_dir, "snp_detection")
 
         # Phase reads (one-time, using normalized hap1 as reference)
         phased_hifi = {}
         phased_ont = {}
-        skip_phasing = False
 
-        if self.resume and checkpoint_state.phase in ('filling', 'complete'):
-            existing_phased = self.checkpoint.get_phased_reads()
-            if existing_phased:
-                self.logger.info("STEP 2: Reusing phased reads from checkpoint")
-                skip_phasing = True
-                # Reconstruct phased_hifi and phased_ont
-                for key, path in existing_phased.items():
-                    if '_hifi' in key:
-                        hap = key.replace('_hifi', '')
-                        phased_hifi[hap] = path
-                    elif '_ont' in key:
-                        hap = key.replace('_ont', '')
-                        phased_ont[hap] = path
-
-        if not skip_phasing:
+        if _is_done(self.output_dir, "phasing"):
+            self.logger.info("STEP 2: Reusing phased reads")
+            # Reconstruct phased_hifi and phased_ont from files
+            for hap_name in self.hap_names:
+                hifi_path = self.output_dir / f"phased_{hap_name}_hifi.fasta"
+                ont_path = self.output_dir / f"phased_{hap_name}_ont.fasta"
+                if hifi_path.exists():
+                    phased_hifi[hap_name] = hifi_path
+                if ont_path.exists():
+                    phased_ont[hap_name] = ont_path
+            # Check for ambiguous reads
+            ambiguous_hifi = self.output_dir / "phased" / "ambiguous_hifi.fasta"
+            ambiguous_ont = self.output_dir / "phased" / "ambiguous_ont.fasta"
+            if ambiguous_hifi.exists():
+                phased_hifi['ambiguous'] = ambiguous_hifi
+            if ambiguous_ont.exists():
+                phased_ont['ambiguous'] = ambiguous_ont
+        else:
             if self.hifi_reads:
                 self.logger.info("STEP 2a: Phasing HiFi reads...")
                 hifi_bam = self.output_dir / "phase_hifi.bam"
@@ -393,17 +374,11 @@ class OptimizedPolyploidEngine:
                 phased_paths['ambiguous_hifi'] = str(phased_hifi['ambiguous'])
             if 'ambiguous' in phased_ont:
                 phased_paths['ambiguous_ont'] = str(phased_ont['ambiguous'])
-            self.checkpoint.set_phased_reads(phased_paths)
 
-            checkpoint_state.phase = "phasing"
-            self.checkpoint.save(checkpoint_state)
+            _mark_done(self.output_dir, "phasing")
 
         # Prepare combined phased reads per haplotype
         combined_reads = self._prepare_combined_reads(phased_hifi, phased_ont)
-
-        # Update checkpoint phase to filling
-        checkpoint_state.phase = "filling"
-        self.checkpoint.save(checkpoint_state)
 
         # =====================================================================
         # PHASE 2: Iterative gap filling with batch alignment
@@ -578,9 +553,9 @@ class OptimizedPolyploidEngine:
 
         self._save_summary(final_assemblies, filled_gaps, failed_gaps, phaser)
 
-        # Mark checkpoint as complete
-        self.checkpoint.mark_complete()
-        self.logger.info("Checkpoint marked as complete")
+        # Mark as complete
+        _mark_done(self.output_dir, "complete")
+        self.logger.info("Optimized polyploid gap filling complete")
 
         return final_assemblies
 

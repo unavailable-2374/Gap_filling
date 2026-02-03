@@ -35,6 +35,30 @@ from gapfill.utils.checkpoint import CheckpointManager, CheckpointState
 from gapfill.utils.reads_cache import ReadsCache, GapReadsExtractor
 
 
+# =============================================================================
+# Progress Marker (.ok file) utilities
+# =============================================================================
+
+def _mark_done(path: Path, step: str) -> Path:
+    """Create a .ok marker file to indicate step completion"""
+    ok_file = path / f"{step}.ok"
+    ok_file.touch()
+    return ok_file
+
+
+def _is_done(path: Path, step: str) -> bool:
+    """Check if a step has been completed (has .ok file)"""
+    ok_file = path / f"{step}.ok"
+    return ok_file.exists()
+
+
+def _clear_marker(path: Path, step: str):
+    """Remove a .ok marker file"""
+    ok_file = path / f"{step}.ok"
+    if ok_file.exists():
+        ok_file.unlink()
+
+
 class HaploidEngine:
     """
     Iterative gap filler for haploid genomes
@@ -89,6 +113,7 @@ class HaploidEngine:
 
         # Gap status tracker (tracks UNFILLABLE, NEEDS_POLISH, etc.)
         self.gap_tracker = GapStatusTracker()
+        self.gap_tracker_file = self.output_dir / "gap_tracker.json"
 
         # Reads cache for optimized mode (filter once, use many times)
         self.reads_cache: Optional[ReadsCache] = None
@@ -133,65 +158,65 @@ class HaploidEngine:
         current_assembly = self.initial_assembly
         start_iteration = 0
 
-        # Check for existing checkpoint
-        checkpoint_state = None
-        if self.resume:
-            if self.checkpoint.exists():
-                checkpoint_state = self.checkpoint.load()
-                if checkpoint_state:
-                    self.logger.info("=" * 60)
-                    self.logger.info("RESUMING FROM CHECKPOINT")
-                    self.logger.info(f"  Phase: {checkpoint_state.phase}")
-                    self.logger.info(f"  Iteration: {checkpoint_state.iteration}")
-                    self.logger.info(f"  Completed gaps: {len(checkpoint_state.completed_gaps)}")
-                    self.logger.info("=" * 60)
-            else:
-                self.logger.info("=" * 60)
-                self.logger.info("No checkpoint.json found, scanning existing files...")
-                checkpoint_state = self.checkpoint.scan_existing_files()
-                if checkpoint_state.phase != "init":
-                    self.logger.info(f"  Detected phase: {checkpoint_state.phase}")
-                    self.logger.info(f"  Detected iteration: {checkpoint_state.iteration}")
-                    self.checkpoint.save(checkpoint_state)
-                else:
-                    self.logger.info("  No usable files found, starting fresh")
-                    checkpoint_state = None
-                self.logger.info("=" * 60)
+        # Track gap states
+        completely_filled_gaps: Set[str] = set()
+        partially_filled_gaps: Set[str] = set()
+        failed_gaps: Set[str] = set()
 
-        # Initialize checkpoint state if not resuming
-        if not checkpoint_state:
-            checkpoint_state = CheckpointState(
-                engine="haploid",
-                phase="init",
-                max_iterations=self.max_iterations
-            )
-            self.checkpoint.save(checkpoint_state)
+        # =====================================================================
+        # RESUME DETECTION (using .ok files)
+        # =====================================================================
+        if self.resume:
+            self.logger.info("=" * 60)
+            self.logger.info("CHECKING FOR RESUME POINTS...")
+
+            # Load gap tracker state if exists
+            if self._load_gap_tracker():
+                self.logger.info("  Loaded gap tracker state")
+
+            # Check preprocessing
+            if _is_done(self.output_dir, "preprocessing"):
+                self.logger.info("  Preprocessing: DONE")
+                # Find the preprocessed assembly
+                polished = self.output_dir / "assembly_polished.fasta"
+                normalized = self.output_dir / "assembly_normalized.fasta"
+                if polished.exists():
+                    current_assembly = polished
+                elif normalized.exists():
+                    current_assembly = normalized
+            else:
+                self.logger.info("  Preprocessing: NOT DONE")
+
+            # Find latest completed iteration
+            for i in range(self.max_iterations, 0, -1):
+                iter_dir = self.output_dir / f"iteration_{i}"
+                if _is_done(iter_dir, "iteration"):
+                    start_iteration = i
+                    # Use the filled assembly from this iteration
+                    filled_asm = iter_dir / "assembly_filled.fasta"
+                    reverted_asm = iter_dir / "assembly_reverted.fasta"
+                    if reverted_asm.exists():
+                        current_assembly = reverted_asm
+                    elif filled_asm.exists():
+                        current_assembly = filled_asm
+                    self.logger.info(f"  Last completed iteration: {i}")
+                    break
+
+            self.logger.info(f"  Current assembly: {current_assembly}")
+            self.logger.info("=" * 60)
 
         # =====================================================================
         # PREPROCESSING PHASE (before iteration loop)
         # =====================================================================
-        if not self.resume or checkpoint_state.phase == "init":
-            current_assembly = self._run_preprocessing(current_assembly, checkpoint_state)
-
-        # Update checkpoint phase
-        checkpoint_state.phase = "filling"
-        checkpoint_state.current_assembly = str(current_assembly)
-        self.checkpoint.save(checkpoint_state)
-
-        # Load gap states from checkpoint
-        completely_filled_gaps = self.checkpoint.get_completed_gap_names()
-        partially_filled_gaps = set(checkpoint_state.partially_filled_gaps.keys())
-        failed_gaps = self.checkpoint.get_failed_gap_names()
-
-        # Determine starting iteration
-        if self.resume and checkpoint_state.iteration > 0:
-            start_iteration = self.checkpoint.get_resume_iteration()
-            self.logger.info(f"Resuming from iteration {start_iteration + 1}")
-
-            if checkpoint_state.current_assembly:
-                checkpoint_assembly = Path(checkpoint_state.current_assembly)
-                if checkpoint_assembly.exists():
-                    current_assembly = checkpoint_assembly
+        if not _is_done(self.output_dir, "preprocessing"):
+            current_assembly = self._run_preprocessing(current_assembly)
+            _mark_done(self.output_dir, "preprocessing")
+            self._save_gap_tracker()
+        else:
+            self.logger.info("Skipping preprocessing (already done)")
+            # Load initial gaps for later Hi-C validation
+            self.initial_gaps = self._find_gaps(current_assembly)
+            self.stats['total_gaps_initial'] = len(self.initial_gaps)
 
         # =====================================================================
         # ITERATION LOOP
@@ -203,70 +228,102 @@ class HaploidEngine:
             self.logger.info(f"ITERATION {iteration}")
             self.logger.info(f"{'='*60}")
 
-            checkpoint_state.iteration = iteration
-            self.checkpoint.save(checkpoint_state)
-
             iter_dir = self.output_dir / f"iteration_{iteration}"
             iter_dir.mkdir(exist_ok=True)
 
+            # Check if this iteration is already complete
+            if _is_done(iter_dir, "iteration"):
+                self.logger.info("  Iteration already complete, skipping...")
+                # Load assembly from this iteration
+                reverted_asm = iter_dir / "assembly_reverted.fasta"
+                filled_asm = iter_dir / "assembly_filled.fasta"
+                if reverted_asm.exists():
+                    current_assembly = reverted_asm
+                elif filled_asm.exists():
+                    current_assembly = filled_asm
+                continue
+
             # Step 1: Align reads (use filtered reads in optimized mode)
-            self.logger.info("Step 1: Aligning reads...")
+            hifi_bam = None
+            ont_bam = None
 
-            # OPTIMIZATION: Reuse preprocessing BAM for iteration 1 if no polishing occurred
-            if (iteration == 1 and
-                self._can_reuse_preprocessing_bam and
-                self._preprocessing_assembly == current_assembly):
+            if not _is_done(iter_dir, "alignment"):
+                self.logger.info("Step 1: Aligning reads...")
 
-                self.logger.info("  Reusing preprocessing BAM (no polishing occurred)...")
-                hifi_bam = self._preprocessing_hifi_bam
-                ont_bam = self._preprocessing_ont_bam
+                # OPTIMIZATION: Reuse preprocessing BAM for iteration 1 if no polishing occurred
+                if (iteration == 1 and
+                    self._can_reuse_preprocessing_bam and
+                    self._preprocessing_assembly == current_assembly):
 
-                # Create symlinks in iteration directory for consistency
-                if hifi_bam and hifi_bam.exists():
-                    iter_hifi_bam = iter_dir / "hifi.bam"
-                    iter_hifi_bai = iter_dir / "hifi.bam.bai"
-                    if not iter_hifi_bam.exists():
-                        iter_hifi_bam.symlink_to(hifi_bam)
-                    if hifi_bam.with_suffix('.bam.bai').exists() and not iter_hifi_bai.exists():
-                        iter_hifi_bai.symlink_to(hifi_bam.with_suffix('.bam.bai'))
-                    hifi_bam = iter_hifi_bam
+                    self.logger.info("  Reusing preprocessing BAM (no polishing occurred)...")
+                    hifi_bam = self._preprocessing_hifi_bam
+                    ont_bam = self._preprocessing_ont_bam
 
-                if ont_bam and ont_bam.exists():
-                    iter_ont_bam = iter_dir / "ont.bam"
-                    iter_ont_bai = iter_dir / "ont.bam.bai"
-                    if not iter_ont_bam.exists():
-                        iter_ont_bam.symlink_to(ont_bam)
-                    if ont_bam.with_suffix('.bam.bai').exists() and not iter_ont_bai.exists():
-                        iter_ont_bai.symlink_to(ont_bam.with_suffix('.bam.bai'))
-                    ont_bam = iter_ont_bam
+                    # Create symlinks in iteration directory for consistency
+                    if hifi_bam and hifi_bam.exists():
+                        iter_hifi_bam = iter_dir / "hifi.bam"
+                        iter_hifi_bai = iter_dir / "hifi.bam.bai"
+                        if not iter_hifi_bam.exists():
+                            iter_hifi_bam.symlink_to(hifi_bam)
+                        if hifi_bam.with_suffix('.bam.bai').exists() and not iter_hifi_bai.exists():
+                            iter_hifi_bai.symlink_to(hifi_bam.with_suffix('.bam.bai'))
+                        hifi_bam = iter_hifi_bam
 
-            elif self.optimized_mode and self.reads_cache:
-                # Use filtered reads for faster alignment
-                hifi_bam, ont_bam = self._align_filtered_reads(current_assembly, iter_dir)
+                    if ont_bam and ont_bam.exists():
+                        iter_ont_bam = iter_dir / "ont.bam"
+                        iter_ont_bai = iter_dir / "ont.bam.bai"
+                        if not iter_ont_bam.exists():
+                            iter_ont_bam.symlink_to(ont_bam)
+                        if ont_bam.with_suffix('.bam.bai').exists() and not iter_ont_bai.exists():
+                            iter_ont_bai.symlink_to(ont_bam.with_suffix('.bam.bai'))
+                        ont_bam = iter_ont_bam
+
+                elif self.optimized_mode and self.reads_cache:
+                    # Use filtered reads for faster alignment
+                    hifi_bam, ont_bam = self._align_filtered_reads(current_assembly, iter_dir)
+                else:
+                    hifi_bam, ont_bam = self._align_reads_with_cache(current_assembly, iter_dir)
+
+                _mark_done(iter_dir, "alignment")
             else:
-                hifi_bam, ont_bam = self._align_reads_with_cache(current_assembly, iter_dir)
+                self.logger.info("Step 1: Alignment already done, reusing...")
+                hifi_bam = iter_dir / "hifi.bam" if (iter_dir / "hifi.bam").exists() else None
+                ont_bam = iter_dir / "ont.bam" if (iter_dir / "ont.bam").exists() else None
 
             if not hifi_bam and not ont_bam:
                 self.logger.error("No BAM files generated")
                 break
 
             # Step 2: Validate previous iteration's fills (if any)
-            assembly_before_validation = current_assembly
-            if iteration > 1:
-                pending_fills = self.gap_tracker.get_pending_fills()
-                if pending_fills:
-                    self.logger.info(f"Step 2: Validating {len(pending_fills)} fills from previous iteration...")
-                    current_assembly = self._validate_previous_fills(
-                        current_assembly, pending_fills, hifi_bam, ont_bam, iter_dir
-                    )
+            if not _is_done(iter_dir, "validation"):
+                assembly_before_validation = current_assembly
+                if iteration > 1:
+                    pending_fills = self.gap_tracker.get_pending_fills()
+                    if pending_fills:
+                        self.logger.info(f"Step 2: Validating {len(pending_fills)} fills from previous iteration...")
+                        current_assembly = self._validate_previous_fills(
+                            current_assembly, pending_fills, hifi_bam, ont_bam, iter_dir
+                        )
 
-                    # If assembly changed (reverts occurred), re-align reads
-                    if current_assembly != assembly_before_validation:
-                        self.logger.info("Step 2b: Re-aligning reads to reverted assembly...")
-                        if self.optimized_mode and self.reads_cache:
-                            hifi_bam, ont_bam = self._align_filtered_reads(current_assembly, iter_dir)
-                        else:
-                            hifi_bam, ont_bam = self._align_reads_with_cache(current_assembly, iter_dir)
+                        # If assembly changed (reverts occurred), re-align reads
+                        if current_assembly != assembly_before_validation:
+                            self.logger.info("Step 2b: Re-aligning reads to reverted assembly...")
+                            # Clear alignment.ok since we need to re-align
+                            _clear_marker(iter_dir, "alignment")
+                            if self.optimized_mode and self.reads_cache:
+                                hifi_bam, ont_bam = self._align_filtered_reads(current_assembly, iter_dir)
+                            else:
+                                hifi_bam, ont_bam = self._align_reads_with_cache(current_assembly, iter_dir)
+                            _mark_done(iter_dir, "alignment")
+
+                _mark_done(iter_dir, "validation")
+                self._save_gap_tracker()
+            else:
+                self.logger.info("Step 2: Validation already done, skipping...")
+                # Check if there's a reverted assembly from previous validation
+                reverted_asm = iter_dir / "assembly_reverted.fasta"
+                if reverted_asm.exists():
+                    current_assembly = reverted_asm
 
             # Step 3: Find gaps
             self.logger.info("Step 3: Finding gaps...")
@@ -430,15 +487,16 @@ class HaploidEngine:
                     current_assembly, successful_fills, iter_dir
                 )
 
-            # Update checkpoint with current assembly
-            self.checkpoint.set_current_assembly(str(current_assembly))
-
             # Save iteration stats
             self._save_iteration_stats(iter_dir, iteration, fill_results)
 
             # Log status summary
             tracker_summary = self.gap_tracker.get_summary()
             self.logger.info(f"  Status summary: {tracker_summary}")
+
+            # Save gap tracker state and mark iteration complete
+            self._save_gap_tracker()
+            _mark_done(iter_dir, "iteration")
 
             # Check for progress (no new fills and no pending validation)
             pending_count = len(self.gap_tracker.get_pending_fills())
@@ -477,10 +535,11 @@ class HaploidEngine:
                                           f"(anomaly: {v.anomaly_type})")
 
         self._save_final_stats()
+        self._save_gap_tracker()
 
-        # Mark checkpoint as complete
-        self.checkpoint.mark_complete()
-        self.logger.info("Checkpoint marked as complete")
+        # Mark as complete
+        _mark_done(self.output_dir, "complete")
+        self.logger.info("Gap filling complete")
 
         self.logger.info(f"\nFinal assembly: {final_assembly}")
         return final_assembly
@@ -559,7 +618,7 @@ class HaploidEngine:
 
         return hifi_bam, ont_bam
 
-    def _run_preprocessing(self, assembly: Path, checkpoint_state) -> Path:
+    def _run_preprocessing(self, assembly: Path) -> Path:
         """
         Run preprocessing phase before iteration loop.
 
@@ -575,6 +634,8 @@ class HaploidEngine:
             Path to preprocessed assembly (normalized and polished)
         """
         current_assembly = assembly
+        preprocess_dir = self.output_dir / "preprocessing"
+        preprocess_dir.mkdir(exist_ok=True)
 
         # Step 0a: Find initial gaps
         initial_gaps = self._find_gaps(current_assembly)
@@ -584,13 +645,14 @@ class HaploidEngine:
 
         # Step 0b: Prepare Hi-C data if available
         if self.hic_reads or self.hic_bam:
-            existing_hic_bam = self.checkpoint.get_intermediate_file('hic_bam')
-            if existing_hic_bam and self.resume:
-                self.logger.info(f"STEP 0b: Reusing existing Hi-C BAM: {existing_hic_bam}")
-                self.hic_bam = Path(existing_hic_bam)  # Ensure Path type
+            hic_bam_file = preprocess_dir / "hic.bam"
+            if _is_done(preprocess_dir, "hic") and hic_bam_file.exists():
+                self.logger.info(f"STEP 0b: Reusing existing Hi-C BAM")
+                self.hic_bam = hic_bam_file
             else:
                 self.logger.info("STEP 0b: Preparing Hi-C data")
-            self._prepare_hic_data(current_assembly)
+                self._prepare_hic_data(current_assembly)
+                _mark_done(preprocess_dir, "hic")
 
             # Estimate gap sizes using Hi-C
             if self.hic_analyzer and initial_gaps:
@@ -602,30 +664,30 @@ class HaploidEngine:
                         self.logger.info(f"    {est.gap_name}: estimated {est.estimated_size}bp")
 
         # Step 0c: Normalize gaps
-        if initial_gaps and not self.skip_normalization:
-            existing_normalized = self.checkpoint.get_intermediate_file('normalized_assembly')
-            if existing_normalized and self.resume:
-                self.logger.info(f"STEP 0c: Reusing normalized assembly: {existing_normalized}")
-                current_assembly = Path(existing_normalized)
-            else:
-                self.logger.info("STEP 0c: Normalizing gaps to 500N...")
-                current_assembly = self._normalize_gaps(current_assembly, initial_gaps)
-                self.checkpoint.set_intermediate_file('normalized_assembly', str(current_assembly))
+        normalized_file = self.output_dir / "assembly_normalized.fasta"
+        if _is_done(self.output_dir, "normalized") and normalized_file.exists():
+            self.logger.info(f"STEP 0c: Reusing normalized assembly")
+            current_assembly = normalized_file
+        elif initial_gaps and not self.skip_normalization:
+            self.logger.info("STEP 0c: Normalizing gaps to 500N...")
+            current_assembly = self._normalize_gaps(current_assembly, initial_gaps)
+            _mark_done(self.output_dir, "normalized")
         elif self.skip_normalization:
             self.logger.info("STEP 0c: Skipping normalization (already done)")
             import shutil
-            normalized_file = self.output_dir / "assembly_normalized.fasta"
             shutil.copy(current_assembly, normalized_file)
             current_assembly = normalized_file
-            self.checkpoint.set_intermediate_file('normalized_assembly', str(current_assembly))
+            _mark_done(self.output_dir, "normalized")
 
         # Step 0d: Initial alignment for pre-assessment
-        self.logger.info("STEP 0d: Initial alignment for pre-assessment...")
-        preprocess_dir = self.output_dir / "preprocessing"
-        preprocess_dir.mkdir(exist_ok=True)
-
-        # Use _align_reads_with_cache which handles resume/reuse internally
-        hifi_bam, ont_bam = self._align_reads_with_cache(current_assembly, preprocess_dir)
+        if not _is_done(preprocess_dir, "alignment"):
+            self.logger.info("STEP 0d: Initial alignment for pre-assessment...")
+            hifi_bam, ont_bam = self._align_reads_with_cache(current_assembly, preprocess_dir)
+            _mark_done(preprocess_dir, "alignment")
+        else:
+            self.logger.info("STEP 0d: Reusing existing alignment...")
+            hifi_bam = preprocess_dir / "hifi.bam" if (preprocess_dir / "hifi.bam").exists() else None
+            ont_bam = preprocess_dir / "ont.bam" if (preprocess_dir / "ont.bam").exists() else None
 
         # Track preprocessing BAM paths for potential reuse in iteration 1
         self._preprocessing_hifi_bam = hifi_bam
@@ -638,46 +700,61 @@ class HaploidEngine:
 
         # Step 0e: Filter reads (OPTIMIZATION - filter once, use many times)
         if self.optimized_mode and self.reads_cache:
-            self.logger.info("STEP 0e: Filtering reads (keeping gap-related reads only)...")
-            gaps = self._find_gaps(current_assembly)
-            self.reads_cache.set_gap_regions(gaps)
+            if not _is_done(preprocess_dir, "filter"):
+                self.logger.info("STEP 0e: Filtering reads (keeping gap-related reads only)...")
+                gaps = self._find_gaps(current_assembly)
+                self.reads_cache.set_gap_regions(gaps)
 
-            if hifi_bam and not self.reads_cache.is_cached('hifi'):
-                self.reads_cache.filter_bam(hifi_bam, 'hifi', self.min_mapq)
-                cache_summary = self.reads_cache.get_summary()
-                self.logger.info(f"  HiFi: kept {cache_summary['hifi']['stats']['kept']:,} / "
-                               f"{cache_summary['hifi']['stats']['total']:,} reads "
-                               f"({cache_summary['hifi']['stats']['kept_ratio']*100:.1f}%)")
+                if hifi_bam and not self.reads_cache.is_cached('hifi'):
+                    self.reads_cache.filter_bam(hifi_bam, 'hifi', self.min_mapq)
+                    cache_summary = self.reads_cache.get_summary()
+                    self.logger.info(f"  HiFi: kept {cache_summary['hifi']['stats']['kept']:,} / "
+                                   f"{cache_summary['hifi']['stats']['total']:,} reads "
+                                   f"({cache_summary['hifi']['stats']['kept_ratio']*100:.1f}%)")
 
-            if ont_bam and not self.reads_cache.is_cached('ont'):
-                self.reads_cache.filter_bam(ont_bam, 'ont', self.min_mapq)
-                cache_summary = self.reads_cache.get_summary()
-                self.logger.info(f"  ONT: kept {cache_summary['ont']['stats']['kept']:,} / "
-                               f"{cache_summary['ont']['stats']['total']:,} reads "
-                               f"({cache_summary['ont']['stats']['kept_ratio']*100:.1f}%)")
+                if ont_bam and not self.reads_cache.is_cached('ont'):
+                    self.reads_cache.filter_bam(ont_bam, 'ont', self.min_mapq)
+                    cache_summary = self.reads_cache.get_summary()
+                    self.logger.info(f"  ONT: kept {cache_summary['ont']['stats']['kept']:,} / "
+                                   f"{cache_summary['ont']['stats']['total']:,} reads "
+                                   f"({cache_summary['ont']['stats']['kept_ratio']*100:.1f}%)")
 
-            self.checkpoint.set_intermediate_file('reads_cache_ready', 'true')
+                _mark_done(preprocess_dir, "filter")
+            else:
+                self.logger.info("STEP 0e: Reads already filtered")
+                # Re-initialize reads_cache with existing gaps
+                gaps = self._find_gaps(current_assembly)
+                self.reads_cache.set_gap_regions(gaps)
 
         # Step 0f: Pre-assess gap flanks
-        self.logger.info("STEP 0f: Pre-assessing gap flanks...")
-        gaps = self._find_gaps(current_assembly)
-        gaps_needing_polish = self._pre_assess_gaps(gaps, hifi_bam, ont_bam)
-
-        # Step 0g: Polish problematic flanks
+        polished_file = self.output_dir / "assembly_polished.fasta"
         polishing_occurred = False
-        if gaps_needing_polish:
-            self.logger.info(f"STEP 0g: Polishing {len(gaps_needing_polish)} gap flanks...")
-            polished_assembly = self._polish_gap_flanks(
-                current_assembly, gaps_needing_polish, hifi_bam, ont_bam, preprocess_dir
-            )
 
-            if polished_assembly != current_assembly:
-                current_assembly = polished_assembly
-                self.checkpoint.set_intermediate_file('polished_assembly', str(current_assembly))
-                self.logger.info("  Polishing complete, will re-align in first iteration")
-                polishing_occurred = True
+        if not _is_done(preprocess_dir, "polish"):
+            self.logger.info("STEP 0f: Pre-assessing gap flanks...")
+            gaps = self._find_gaps(current_assembly)
+            gaps_needing_polish = self._pre_assess_gaps(gaps, hifi_bam, ont_bam)
+
+            # Step 0g: Polish problematic flanks
+            if gaps_needing_polish:
+                self.logger.info(f"STEP 0g: Polishing {len(gaps_needing_polish)} gap flanks...")
+                polished_assembly = self._polish_gap_flanks(
+                    current_assembly, gaps_needing_polish, hifi_bam, ont_bam, preprocess_dir
+                )
+
+                if polished_assembly != current_assembly:
+                    current_assembly = polished_assembly
+                    self.logger.info("  Polishing complete, will re-align in first iteration")
+                    polishing_occurred = True
+            else:
+                self.logger.info("  No flanks need polishing")
+
+            _mark_done(preprocess_dir, "polish")
         else:
-            self.logger.info("  No flanks need polishing")
+            self.logger.info("STEP 0f-0g: Polish already done")
+            if polished_file.exists():
+                current_assembly = polished_file
+                polishing_occurred = True
 
         # Mark whether preprocessing BAM can be reused for iteration 1
         self._can_reuse_preprocessing_bam = not polishing_occurred
@@ -1286,6 +1363,31 @@ class HaploidEngine:
         self.logger.info(f"  Completely filled: {self.stats['gaps_completely_filled']}")
         self.logger.info(f"  Partially filled: {self.stats['gaps_partially_filled']}")
         self.logger.info(f"  Failed: {self.stats['gaps_failed']}")
+
+    def _save_gap_tracker(self):
+        """Save gap tracker state to file for resume support"""
+        try:
+            tracker_data = self.gap_tracker.to_dict()
+            with open(self.gap_tracker_file, 'w') as f:
+                json.dump(tracker_data, f, indent=2)
+            self.logger.debug(f"Saved gap tracker state to {self.gap_tracker_file}")
+        except Exception as e:
+            self.logger.warning(f"Failed to save gap tracker: {e}")
+
+    def _load_gap_tracker(self) -> bool:
+        """Load gap tracker state from file. Returns True if loaded successfully."""
+        if not self.gap_tracker_file.exists():
+            return False
+        try:
+            with open(self.gap_tracker_file) as f:
+                tracker_data = json.load(f)
+            self.gap_tracker = GapStatusTracker.from_dict(tracker_data)
+            pending_count = len(self.gap_tracker.get_pending_fills())
+            self.logger.info(f"Loaded gap tracker state: {pending_count} pending fills")
+            return True
+        except Exception as e:
+            self.logger.warning(f"Failed to load gap tracker: {e}")
+            return False
 
     def _pre_assess_gaps(self, gaps: List[Dict], hifi_bam: Optional[Path], ont_bam: Optional[Path]) -> List[Dict]:
         """

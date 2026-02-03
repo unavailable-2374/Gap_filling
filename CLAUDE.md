@@ -413,7 +413,7 @@ STEP 3: Gap filling (skip_normalization=True)
 - `ReadPhaser._detect_snps_alignment()` - alignment-based SNP 检测
 - `ReadPhaser._assign_read_to_haplotype_detailed()` - SNP-based 分配
 
-### 6. 断点续跑 (utils/checkpoint.py)
+### 6. 断点续跑 (.ok 文件机制)
 
 **使用方法：**
 ```bash
@@ -427,15 +427,40 @@ python -m gapfill -a assembly.fa --hifi hifi.fq -o output --resume
 python -m gapfill -a assembly.fa --hifi hifi.fq -o output --clear-checkpoint
 ```
 
+**进度标记 (.ok 文件)：**
+
+```
+output/
+├── normalized.ok              # gap 标准化完成
+├── preprocessing.ok           # 预处理完成
+├── gap_tracker.json           # GapStatusTracker 状态 (含 pending_fills)
+├── preprocessing/
+│   ├── alignment.ok           # 初始比对完成
+│   ├── filter.ok              # reads 过滤完成
+│   ├── hic.ok                 # Hi-C 准备完成
+│   └── polish.ok              # flank polish 完成
+├── iteration_1/
+│   ├── alignment.ok           # 比对完成
+│   ├── validation.ok          # 验证完成
+│   └── iteration.ok           # 本轮完成
+└── complete.ok                # 全部完成
+```
+
+**关键改进：**
+- 使用 `.ok` 文件而非 checkpoint.json 判断进度
+- `gap_tracker.json` 单独保存，包含 pending_fills
+- 每步完成后立即创建 `.ok` 文件
+- resume 时检查 `.ok` 文件决定跳过哪些步骤
+
 **状态跟踪：**
 
-| 阶段 | 单倍体 | 多倍体 | 可复用文件 |
-|------|--------|--------|-----------|
-| normalization | ✓ | ✓ | assembly_normalized.fasta |
-| polish | ✓ | ✓ | assembly_polished.fasta |
-| snp_detection | - | ✓ | snp_database.json |
-| phasing | - | ✓ | phased_*_hifi.fasta |
-| filling | ✓ | ✓ | iteration_N/*.bam |
+| 阶段 | 单倍体 | 多倍体 | .ok 文件 | 可复用文件 |
+|------|--------|--------|----------|-----------|
+| normalization | ✓ | ✓ | normalized.ok | assembly_normalized.fasta |
+| polish | ✓ | ✓ | preprocessing/polish.ok | assembly_polished.fasta |
+| snp_detection | - | ✓ | snp_detection.ok | snp_database.json |
+| phasing | - | ✓ | phasing.ok | phased_*_hifi.fasta |
+| iteration N | ✓ | ✓ | iteration_N/iteration.ok | assembly_filled.fasta |
 
 ## 命令行参数
 

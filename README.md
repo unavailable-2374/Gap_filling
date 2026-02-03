@@ -10,7 +10,7 @@ Gap filling tool for haploid and polyploid genome assemblies using long-read seq
 - **Delayed validation** - Validates fills in next iteration using properly aligned reads
 - **Automatic flank polishing** - Detects and polishes problematic flanking sequences
 - **Hi-C data support** - Gap size estimation, candidate selection, and fill validation
-- **Checkpoint/resume** - Resume interrupted runs without recomputing
+- **Checkpoint/resume** - Resume interrupted runs using .ok file markers
 - **Optimized polyploid mode** - Batch alignment reduces computation by 75%+ for polyploid genomes
 
 ### Performance Optimizations (v2.0)
