@@ -843,6 +843,13 @@ class PolyploidEngine:
                     phased_hifi[hap_name] = hifi_path
                 if ont_path.exists():
                     phased_ont[hap_name] = ont_path
+            # Also load ambiguous reads
+            ambiguous_hifi = self.output_dir / "phased_ambiguous_hifi.fasta"
+            ambiguous_ont = self.output_dir / "phased_ambiguous_ont.fasta"
+            if ambiguous_hifi.exists():
+                phased_hifi['ambiguous'] = ambiguous_hifi
+            if ambiguous_ont.exists():
+                phased_ont['ambiguous'] = ambiguous_ont
         else:
             # Collect gap regions for filtering
             gap_regions_for_filter = {}
