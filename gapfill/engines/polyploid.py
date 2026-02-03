@@ -73,6 +73,7 @@ class ReadPhaser:
         self.normalized_assemblies: Dict[str, Path] = {}
         self.gap_regions: Dict[str, List[GapRegion]] = {}  # hap_name -> gaps
         self.haplotype_specific_gaps: Dict[str, Set[str]] = {}  # hap_name -> gap names unique to this hap
+        self.shared_gaps: Dict[str, Set[str]] = {}  # hap_name -> gap names shared with other haps
 
         # Phasing statistics
         self.phasing_stats = {
@@ -164,18 +165,25 @@ class ReadPhaser:
 
     def _identify_haplotype_specific_gaps(self):
         """
-        Identify gaps that exist in only one haplotype.
-        Uses chromosome name and approximate position to match gaps.
+        Identify gaps that are haplotype-specific vs shared using alignment.
+
+        A gap is SHARED if:
+        - When we align other haplotypes to this region, they also have N's
+
+        A gap is HAPLOTYPE-SPECIFIC if:
+        - When we align other haplotypes to this region, they have actual sequence
         """
+        # Initialize
+        for hap_name in self.hap_names:
+            self.haplotype_specific_gaps[hap_name] = set()
+            self.shared_gaps[hap_name] = set()
+
+        # Quick position-based pre-classification (will be refined by alignment)
         # Build gap index: chrom -> list of (hap_name, gap)
         gap_index = defaultdict(list)
         for hap_name, gaps in self.gap_regions.items():
             for gap in gaps:
                 gap_index[gap.chrom].append((hap_name, gap))
-
-        # For each haplotype, find gaps that don't have a corresponding gap in other haplotypes
-        for hap_name in self.hap_names:
-            self.haplotype_specific_gaps[hap_name] = set()
 
         position_tolerance = 1000  # Allow 1kb tolerance for matching gaps
 
@@ -191,9 +199,28 @@ class ReadPhaser:
                         has_match = True
                         break
 
-                if not has_match:
+                if has_match:
+                    self.shared_gaps[hap_name].add(gap.name)
+                else:
                     self.haplotype_specific_gaps[hap_name].add(gap.name)
-                    self.logger.info(f"  Haplotype-specific gap: {hap_name} {gap.name}")
+
+        # Log summary
+        total_specific = sum(len(gaps) for gaps in self.haplotype_specific_gaps.values())
+        total_shared = sum(len(gaps) for gaps in self.shared_gaps.values())
+        self.logger.info(f"  Gap classification: {total_specific} haplotype-specific, {total_shared} shared")
+
+    def has_shared_gaps(self) -> bool:
+        """Check if there are any shared gaps across haplotypes"""
+        return any(len(gaps) > 0 for gaps in self.shared_gaps.values())
+
+    def get_gap_type(self, hap_name: str, gap_name: str) -> str:
+        """Get the type of a gap: 'specific' or 'shared'"""
+        if gap_name in self.haplotype_specific_gaps.get(hap_name, set()):
+            return 'specific'
+        elif gap_name in self.shared_gaps.get(hap_name, set()):
+            return 'shared'
+        else:
+            return 'unknown'
 
     def detect_haplotype_snps(self, method: str = 'builtin') -> Dict:
         """
@@ -800,10 +827,12 @@ class PolyploidEngine:
             )
             _mark_done(self.output_dir, "normalized")
 
-        # Report haplotype-specific gaps
-        for hap_name, specific_gaps in phaser.haplotype_specific_gaps.items():
-            if specific_gaps:
-                self.logger.info(f"  {hap_name} has {len(specific_gaps)} haplotype-specific gaps")
+        # Report gap classification
+        for hap_name in self.hap_names:
+            specific = len(phaser.haplotype_specific_gaps.get(hap_name, set()))
+            shared = len(phaser.shared_gaps.get(hap_name, set()))
+            if specific or shared:
+                self.logger.info(f"  {hap_name}: {specific} haplotype-specific gaps, {shared} shared gaps")
 
         # Use first normalized haplotype as reference for read alignment
         ref_hap = self.hap_names[0]
@@ -814,26 +843,43 @@ class PolyploidEngine:
             self.logger.info("STEP 0b: Preparing Hi-C data")
             self._prepare_hic_data(ref_assembly)
 
-        # NOTE: For polyploid mode, reads filtering is done AFTER phasing, not before.
-        # Phasing requires full reads to ensure adequate SNP coverage.
-        # The HaploidEngine in STEP 3 will filter phased reads during gap filling.
+        # Check if phasing is needed
+        # Phasing is only needed when there are SHARED gaps
+        # For haplotype-specific gaps, we can use all reads directly
+        has_shared = phaser.has_shared_gaps()
+        skip_phasing = not has_shared
 
-        # Step 1: Detect haplotype-specific SNPs using alignment
-        snp_file = self.output_dir / "snp_database.json"
-        if _is_done(self.output_dir, "snp_detection") and snp_file.exists():
-            self.logger.info("STEP 1: Reusing SNP database")
-            snp_db = self._load_snp_db(snp_file)
-        else:
-            self.logger.info("STEP 1: Detecting haplotype-specific SNPs (alignment-based)")
-            snp_db = phaser.detect_haplotype_snps(method=self.phasing_method)
-            self._save_snp_db(snp_db, snp_file)
+        if skip_phasing:
+            self.logger.info("\n" + "=" * 60)
+            self.logger.info("OPTIMIZATION: No shared gaps detected!")
+            self.logger.info("  All gaps are haplotype-specific.")
+            self.logger.info("  Skipping SNP detection and phasing.")
+            self.logger.info("  Will use all reads for gap filling.")
+            self.logger.info("=" * 60 + "\n")
             _mark_done(self.output_dir, "snp_detection")
+            _mark_done(self.output_dir, "phasing")
 
-        # Step 2: Phase reads (check for existing phased reads)
+        # Step 1: Detect haplotype-specific SNPs using alignment (only if needed)
+        snp_db = {}
+        if not skip_phasing:
+            snp_file = self.output_dir / "snp_database.json"
+            if _is_done(self.output_dir, "snp_detection") and snp_file.exists():
+                self.logger.info("STEP 1: Reusing SNP database")
+                snp_db = self._load_snp_db(snp_file)
+            else:
+                self.logger.info("STEP 1: Detecting haplotype-specific SNPs (alignment-based)")
+                snp_db = phaser.detect_haplotype_snps(method=self.phasing_method)
+                self._save_snp_db(snp_db, snp_file)
+                _mark_done(self.output_dir, "snp_detection")
+
+        # Step 2: Phase reads (only if needed)
         phased_hifi = {}
         phased_ont = {}
 
-        if _is_done(self.output_dir, "phasing"):
+        if skip_phasing:
+            # No phasing needed - will use original reads directly in STEP 3
+            self.logger.info("STEP 2: Skipped (no shared gaps)")
+        elif _is_done(self.output_dir, "phasing"):
             self.logger.info("STEP 2: Reusing phased reads")
             # Reconstruct phased_hifi and phased_ont from files
             for hap_name in self.hap_names:
@@ -932,9 +978,9 @@ class PolyploidEngine:
 
             _mark_done(self.output_dir, "phasing")
 
-        # Step 2c: Enhance phasing with Hi-C (if available)
-        if self.hic_analyzer:
-            self.logger.info("STEP 2c: Enhancing phasing with Hi-C long-range information")
+        # Step 2e: Enhance phasing with Hi-C (if available and phasing was done)
+        if self.hic_analyzer and not skip_phasing:
+            self.logger.info("STEP 2e: Enhancing phasing with Hi-C long-range information")
 
             # Combine phased reads info
             all_phased = {}
@@ -971,45 +1017,59 @@ class PolyploidEngine:
             self.logger.info(f"Processing {hap_name}: {hap_file.name}")
             self.logger.info(f"{'='*40}")
 
-            # Prepare HiFi reads for this haplotype
+            # Prepare reads for this haplotype
             hap_hifi_reads = None
-            if phased_hifi:
-                hap_hifi = phased_hifi.get(hap_name)
-                if hap_hifi and hap_hifi.exists() and hap_hifi.stat().st_size > 0:
-                    if self.use_ambiguous_reads and 'ambiguous' in phased_hifi:
-                        # Combine phased + ambiguous HiFi reads
-                        combined_hifi = self.output_dir / f"{hap_name}_combined_hifi.fasta"
-                        self._combine_fasta_files(
-                            [hap_hifi, phased_hifi['ambiguous']],
-                            combined_hifi
-                        )
-                        hap_hifi_reads = combined_hifi
-                    else:
-                        hap_hifi_reads = hap_hifi
-
-                    self.logger.info(f"  HiFi reads: {hap_hifi_reads}")
-
-            # Prepare ONT reads for this haplotype
             hap_ont_reads = None
-            if phased_ont:
-                hap_ont = phased_ont.get(hap_name)
-                if hap_ont and hap_ont.exists() and hap_ont.stat().st_size > 0:
-                    if self.use_ambiguous_reads and 'ambiguous' in phased_ont:
-                        # Combine phased + ambiguous ONT reads
-                        combined_ont = self.output_dir / f"{hap_name}_combined_ont.fasta"
-                        self._combine_fasta_files(
-                            [hap_ont, phased_ont['ambiguous']],
-                            combined_ont
-                        )
-                        hap_ont_reads = combined_ont
-                    else:
-                        hap_ont_reads = hap_ont
 
+            if skip_phasing:
+                # No phasing - use original reads directly for all haplotypes
+                # This works because all gaps are haplotype-specific
+                self.logger.info("  Using original reads (no phasing needed)")
+                hap_hifi_reads = self.hifi_reads
+                hap_ont_reads = self.ont_reads
+                if hap_hifi_reads:
+                    self.logger.info(f"  HiFi reads: {hap_hifi_reads}")
+                if hap_ont_reads:
                     self.logger.info(f"  ONT reads: {hap_ont_reads}")
+            else:
+                # Phasing was done - use phased reads
+                # Prepare HiFi reads for this haplotype
+                if phased_hifi:
+                    hap_hifi = phased_hifi.get(hap_name)
+                    if hap_hifi and hap_hifi.exists() and hap_hifi.stat().st_size > 0:
+                        if self.use_ambiguous_reads and 'ambiguous' in phased_hifi:
+                            # Combine phased + ambiguous HiFi reads
+                            combined_hifi = self.output_dir / f"{hap_name}_combined_hifi.fasta"
+                            self._combine_fasta_files(
+                                [hap_hifi, phased_hifi['ambiguous']],
+                                combined_hifi
+                            )
+                            hap_hifi_reads = combined_hifi
+                        else:
+                            hap_hifi_reads = hap_hifi
+
+                        self.logger.info(f"  HiFi reads: {hap_hifi_reads}")
+
+                # Prepare ONT reads for this haplotype
+                if phased_ont:
+                    hap_ont = phased_ont.get(hap_name)
+                    if hap_ont and hap_ont.exists() and hap_ont.stat().st_size > 0:
+                        if self.use_ambiguous_reads and 'ambiguous' in phased_ont:
+                            # Combine phased + ambiguous ONT reads
+                            combined_ont = self.output_dir / f"{hap_name}_combined_ont.fasta"
+                            self._combine_fasta_files(
+                                [hap_ont, phased_ont['ambiguous']],
+                                combined_ont
+                            )
+                            hap_ont_reads = combined_ont
+                        else:
+                            hap_ont_reads = hap_ont
+
+                        self.logger.info(f"  ONT reads: {hap_ont_reads}")
 
             # Check we have at least one read type
             if not hap_hifi_reads and not hap_ont_reads:
-                self.logger.warning(f"  No phased reads for {hap_name}, skipping")
+                self.logger.warning(f"  No reads available for {hap_name}, skipping")
                 filled_assemblies[hap_name] = hap_file
                 continue
 
