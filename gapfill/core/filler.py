@@ -32,7 +32,8 @@ import pysam
 from Bio import SeqIO
 
 from gapfill.utils.indexer import AssemblyIndexer
-from gapfill.core.validator import GapValidator, GapStatus, ValidationResult
+from gapfill.core.validator import (GapValidator, GapStatus, ValidationResult,
+                                     PartialFillValidationResult)
 from gapfill.core.consensus import ConsensusBuilder, try_consensus_fill
 
 if TYPE_CHECKING:
@@ -1195,7 +1196,7 @@ class GapFiller:
         Finalize a successful fill result by adding validation info
 
         For complete fills: validates coverage, spanning reads, junction quality
-        For partial fills: validates filled portions
+        For partial fills: validates filled portions independently (left/right)
         """
         if not self.validator:
             return result
@@ -1215,21 +1216,58 @@ class GapFiller:
             return result
 
         try:
-            if result.get('is_complete', False) and not result.get('has_placeholder', False):
-                # Complete fill - validate with full criteria
+            is_complete_fill = result.get('is_complete', False) and not result.get('has_placeholder', False)
+
+            if is_complete_fill:
+                # Complete fill - validate with full criteria (requires spanning reads)
                 validation = self.validator.validate_complete_fill(
                     bam_file, chrom, gap_start, gap_end, result['sequence']
                 )
+
+                # Determine if this fill can skip delayed validation (high confidence)
+                # Criteria for skipping delayed validation:
+                # - Tier 0 or 1 (HiFi-based)
+                # - High spanning read count (>= 5)
+                # - Good coverage (>= 5x)
+                # - High validation confidence (>= 0.7)
+                tier = result.get('tier', 99)
+                total_spanning = (reads_info.get('hifi_spanning_count', 0) +
+                                reads_info.get('ont_spanning_count', 0))
+                skip_delayed_validation = (
+                    tier <= 1 and
+                    total_spanning >= 5 and
+                    validation.avg_coverage >= 5.0 and
+                    getattr(validation, 'confidence', 0) >= 0.7 and
+                    validation.valid
+                )
+
+                # Add validation info to result
+                result['validation'] = {
+                    'valid': validation.valid,
+                    'status': validation.status.value,
+                    'confidence': getattr(validation, 'confidence', 0.5),
+                    'spanning_reads': getattr(validation, 'spanning_reads', 0),
+                    'avg_coverage': validation.avg_coverage,
+                    'reason': validation.reason,
+                    'skip_delayed_validation': skip_delayed_validation
+                }
+
+                if skip_delayed_validation:
+                    self.logger.info(f"    ✓ High-confidence fill: skip delayed validation "
+                                   f"(tier={tier}, spanning={total_spanning}, "
+                                   f"cov={validation.avg_coverage:.1f}x)")
+                else:
+                    self.logger.debug(f"    Validation: {validation.status.value} "
+                                    f"(spanning={getattr(validation, 'spanning_reads', 0)}, "
+                                    f"cov={validation.avg_coverage:.1f}x)")
+
             else:
-                # Partial fill with placeholder - find the new gap boundaries
+                # Partial fill with placeholder - validate independently for each side
                 seq = result['sequence']
-                # Find N-run in sequence (the placeholder)
                 import re
                 n_match = re.search(r'N{10,}', seq)
+
                 if n_match:
-                    # Calculate new gap position in filled assembly coordinates
-                    # After filling, the sequence [gap_start:gap_end] is replaced by 'seq'
-                    # The new 500N placeholder is at [gap_start + n_match.start(), gap_start + n_match.end()]
                     new_gap_start = gap_start + n_match.start()
                     new_gap_end = gap_start + n_match.end()
 
@@ -1237,49 +1275,46 @@ class GapFiller:
                         bam_file, chrom, gap_start, gap_end, seq,
                         new_gap_start, new_gap_end
                     )
+
+                    # Partial fills always go through delayed validation
+                    # because the validation is more complex (independent left/right)
+                    skip_delayed_validation = False
+
+                    # Handle PartialFillValidationResult
+                    if isinstance(validation, PartialFillValidationResult):
+                        result['validation'] = {
+                            'valid': validation.valid,
+                            'status': validation.status.value,
+                            'left_valid': validation.left_valid,
+                            'right_valid': validation.right_valid,
+                            'left_fill_length': validation.left_fill_length,
+                            'right_fill_length': validation.right_fill_length,
+                            'avg_coverage': validation.avg_coverage,
+                            'reason': validation.reason,
+                            'skip_delayed_validation': skip_delayed_validation
+                        }
+                        self.logger.debug(f"    Partial validation: {validation.reason}")
+                    else:
+                        # Fallback for ValidationResult
+                        result['validation'] = {
+                            'valid': validation.valid,
+                            'status': validation.status.value,
+                            'avg_coverage': validation.avg_coverage,
+                            'reason': validation.reason,
+                            'skip_delayed_validation': skip_delayed_validation
+                        }
                 else:
                     # No N-run found but marked as partial - treat as complete
                     validation = self.validator.validate_complete_fill(
                         bam_file, chrom, gap_start, gap_end, result['sequence']
                     )
-
-            # Determine if this fill can skip delayed validation (high confidence)
-            # Criteria for skipping delayed validation:
-            # - Tier 0 or 1 (HiFi-based)
-            # - High spanning read count (>= 5)
-            # - Good coverage (>= 5x)
-            # - High validation confidence (>= 0.7)
-            tier = result.get('tier', 99)
-            total_spanning = (reads_info.get('hifi_spanning_count', 0) +
-                            reads_info.get('ont_spanning_count', 0))
-            skip_delayed_validation = (
-                tier <= 1 and
-                total_spanning >= 5 and
-                validation.avg_coverage >= 5.0 and
-                validation.confidence >= 0.7 and
-                validation.valid
-            )
-
-            # Add validation info to result
-            result['validation'] = {
-                'valid': validation.valid,
-                'status': validation.status.value,
-                'confidence': validation.confidence,
-                'spanning_reads': validation.spanning_reads,
-                'avg_coverage': validation.avg_coverage,
-                'reason': validation.reason,
-                'skip_delayed_validation': skip_delayed_validation
-            }
-
-            if skip_delayed_validation:
-                self.logger.info(f"    ✓ High-confidence fill: skip delayed validation "
-                               f"(tier={tier}, spanning={total_spanning}, "
-                               f"cov={validation.avg_coverage:.1f}x)")
-            else:
-                self.logger.debug(f"    Validation: {validation.status.value} "
-                                f"(confidence={validation.confidence:.2f}, "
-                                f"spanning={validation.spanning_reads}, "
-                                f"cov={validation.avg_coverage:.1f}x)")
+                    result['validation'] = {
+                        'valid': validation.valid,
+                        'status': validation.status.value,
+                        'avg_coverage': validation.avg_coverage,
+                        'reason': validation.reason,
+                        'skip_delayed_validation': False
+                    }
 
         except Exception as e:
             self.logger.warning(f"Validation error: {e}")
