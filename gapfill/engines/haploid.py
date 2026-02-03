@@ -27,7 +27,8 @@ from Bio.SeqRecord import SeqRecord
 from Bio.Seq import Seq
 
 from gapfill.core.filler import GapFiller
-from gapfill.core.validator import GapValidator, GapStatusTracker, GapStatus, PendingFill
+from gapfill.core.validator import (GapValidator, GapStatusTracker, GapStatus, PendingFill,
+                                     PartialFillValidationResult)
 from gapfill.core.parallel import fill_gaps_parallel, fill_gaps_sequential, GapBatcher
 from gapfill.utils.hic import HiCAnalyzer, align_hic_reads
 from gapfill.utils.checkpoint import CheckpointManager, CheckpointState
@@ -715,6 +716,10 @@ class HaploidEngine:
         failed_count = 0
         fills_to_revert = []
 
+        # Track different types of reverts
+        full_reverts = []      # Completely failed fills
+        partial_reverts = []   # Partial fills where one side failed
+
         try:
             for gap_id, pf in pending_fills.items():
                 self.logger.info(f"    Validating {gap_id}...")
@@ -727,13 +732,24 @@ class HaploidEngine:
                     result = validator.validate_complete_fill(
                         bam_file, pf.chrom, pf.filled_start, pf.filled_end, pf.sequence
                     )
-                    self.logger.debug(f"      Complete fill validation: spanning={result.spanning_reads}")
+
+                    if result.valid:
+                        validated_count += 1
+                        self.gap_tracker.set_status(gap_id, GapStatus.FILLED_COMPLETE,
+                                                   f"Validated: {result.reason}")
+                        self.checkpoint.add_completed_gap(gap_id, pf.sequence)
+                        self.logger.info(f"      ✓ Validated {fill_length}bp complete fill "
+                                       f"(cov={result.avg_coverage:.1f}x, spanning={result.spanning_reads})")
+                    else:
+                        failed_count += 1
+                        full_reverts.append(pf)
+                        self.gap_tracker.set_status(gap_id, GapStatus.FAILED,
+                                                   f"Validation failed: {result.reason}")
+                        self.logger.warning(f"      ✗ Failed {fill_length}bp complete fill: {result.reason}")
                 else:
-                    # Partial fills: check junctions and coverage only
-                    # Find the 500N placeholder in the sequence
+                    # Partial fills: check junctions and coverage independently for each side
                     n_match = re.search(r'N{100,}', pf.sequence)
                     if n_match:
-                        # Calculate new gap position in assembly coordinates
                         new_gap_start = pf.filled_start + n_match.start()
                         new_gap_end = pf.filled_start + n_match.end()
 
@@ -743,44 +759,86 @@ class HaploidEngine:
                             pf.sequence,
                             new_gap_start, new_gap_end
                         )
-                        self.logger.debug(f"      Partial fill validation: junction/coverage based")
+
+                        # Handle independent left/right validation
+                        if isinstance(result, PartialFillValidationResult):
+                            if result.left_valid and result.right_valid:
+                                # Both sides passed
+                                validated_count += 1
+                                self.gap_tracker.set_status(gap_id, GapStatus.FILLED_PARTIAL,
+                                                           f"Validated: {result.reason}")
+                                self.checkpoint.add_partial_gap(gap_id, pf.sequence)
+                                self.logger.info(f"      ✓ Validated {fill_length}bp partial fill: {result.reason}")
+
+                            elif result.left_valid or result.right_valid:
+                                # One side passed, one failed - partial revert
+                                validated_count += 1  # Count as partial success
+                                partial_reverts.append({
+                                    'pf': pf,
+                                    'result': result,
+                                    'n_match': n_match,
+                                    'new_gap_start': new_gap_start,
+                                    'new_gap_end': new_gap_end
+                                })
+                                side_kept = "left" if result.left_valid else "right"
+                                side_failed = "right" if result.left_valid else "left"
+                                self.gap_tracker.set_status(gap_id, GapStatus.FILLED_PARTIAL,
+                                                           f"Partial: {side_kept} OK, {side_failed} reverted")
+                                self.logger.info(f"      ⚠ Partial validation: {result.reason}")
+                                self.logger.info(f"        Keeping {side_kept} side, reverting {side_failed} side")
+
+                            else:
+                                # Both sides failed
+                                failed_count += 1
+                                full_reverts.append(pf)
+                                self.gap_tracker.set_status(gap_id, GapStatus.FAILED,
+                                                           f"Validation failed: {result.reason}")
+                                self.logger.warning(f"      ✗ Failed {fill_length}bp partial fill: {result.reason}")
+                        else:
+                            # Fallback for non-PartialFillValidationResult
+                            if result.valid:
+                                validated_count += 1
+                                self.gap_tracker.set_status(gap_id, GapStatus.FILLED_PARTIAL,
+                                                           f"Validated: {result.reason}")
+                                self.checkpoint.add_partial_gap(gap_id, pf.sequence)
+                                self.logger.info(f"      ✓ Validated {fill_length}bp partial fill")
+                            else:
+                                failed_count += 1
+                                full_reverts.append(pf)
+                                self.gap_tracker.set_status(gap_id, GapStatus.FAILED,
+                                                           f"Validation failed: {result.reason}")
+                                self.logger.warning(f"      ✗ Failed {fill_length}bp partial fill: {result.reason}")
                     else:
                         # No N-run found but marked as partial - treat as complete
                         result = validator.validate_complete_fill(
                             bam_file, pf.chrom, pf.filled_start, pf.filled_end, pf.sequence
                         )
-
-                if result.valid:
-                    validated_count += 1
-                    if pf.is_complete:
-                        self.gap_tracker.set_status(gap_id, GapStatus.FILLED_COMPLETE,
-                                                   f"Validated: {result.reason}")
-                        self.checkpoint.add_completed_gap(gap_id, pf.sequence)
-                        self.logger.info(f"      ✓ Validated {fill_length}bp complete fill "
-                                       f"(cov={result.avg_coverage:.1f}x, spanning={result.spanning_reads})")
-                    else:
-                        self.gap_tracker.set_status(gap_id, GapStatus.FILLED_PARTIAL,
-                                                   f"Validated: {result.reason}")
-                        self.checkpoint.add_partial_gap(gap_id, pf.sequence)
-                        self.logger.info(f"      ✓ Validated {fill_length}bp partial fill "
-                                       f"(cov={result.avg_coverage:.1f}x)")
-                else:
-                    failed_count += 1
-                    fills_to_revert.append(pf)
-                    self.gap_tracker.set_status(gap_id, GapStatus.FAILED,
-                                               f"Validation failed: {result.reason}")
-                    self.logger.warning(f"      ✗ Failed {fill_length}bp fill: {result.reason} "
-                                       f"(cov={result.avg_coverage:.1f}x, zero_cov={result.zero_coverage_ratio*100:.1f}%)")
+                        if result.valid:
+                            validated_count += 1
+                            self.gap_tracker.set_status(gap_id, GapStatus.FILLED_COMPLETE,
+                                                       f"Validated: {result.reason}")
+                            self.checkpoint.add_completed_gap(gap_id, pf.sequence)
+                            self.logger.info(f"      ✓ Validated {fill_length}bp fill")
+                        else:
+                            failed_count += 1
+                            full_reverts.append(pf)
+                            self.gap_tracker.set_status(gap_id, GapStatus.FAILED,
+                                                       f"Validation failed: {result.reason}")
+                            self.logger.warning(f"      ✗ Failed {fill_length}bp fill: {result.reason}")
 
         finally:
             validator.close()
 
         self.logger.info(f"  Validation complete: {validated_count} passed, {failed_count} failed")
 
-        # Revert failed fills
-        if fills_to_revert:
-            self.logger.info(f"  Reverting {len(fills_to_revert)} failed fills...")
-            assembly = self._revert_fills(assembly, fills_to_revert, output_dir)
+        # Apply reverts
+        if full_reverts:
+            self.logger.info(f"  Reverting {len(full_reverts)} fully failed fills...")
+            assembly = self._revert_fills(assembly, full_reverts, output_dir)
+
+        if partial_reverts:
+            self.logger.info(f"  Applying {len(partial_reverts)} partial reverts...")
+            assembly = self._partial_revert_fills(assembly, partial_reverts, output_dir)
 
         return assembly
 
@@ -824,6 +882,111 @@ class HaploidEngine:
             sequences[chrom] = seq
 
         # Write reverted assembly
+        with open(reverted_assembly, 'w') as f:
+            for chrom, seq in sequences.items():
+                f.write(f">{chrom}\n")
+                for i in range(0, len(seq), 80):
+                    f.write(seq[i:i+80] + '\n')
+
+        return reverted_assembly
+
+    def _partial_revert_fills(self, assembly: Path, partial_reverts: List[Dict],
+                               output_dir: Path) -> Path:
+        """
+        Partially revert fills where one side passed and one side failed.
+
+        For each partial revert:
+        - If left failed, right passed: keep right_fill, replace left_fill+gap with 500N
+        - If right failed, left passed: keep left_fill, replace gap+right_fill with 500N
+
+        Args:
+            assembly: Current assembly file
+            partial_reverts: List of dicts with 'pf', 'result', 'n_match', etc.
+            output_dir: Output directory
+
+        Returns:
+            Path to modified assembly
+        """
+        if not partial_reverts:
+            return assembly
+
+        reverted_assembly = output_dir / "assembly_partial_reverted.fasta"
+
+        # Load assembly
+        sequences = {}
+        for record in SeqIO.parse(assembly, 'fasta'):
+            sequences[record.id] = str(record.seq)
+
+        # Group by chromosome
+        reverts_by_chrom = {}
+        for revert_info in partial_reverts:
+            pf = revert_info['pf']
+            if pf.chrom not in reverts_by_chrom:
+                reverts_by_chrom[pf.chrom] = []
+            reverts_by_chrom[pf.chrom].append(revert_info)
+
+        # Process each chromosome (from end to start to avoid coordinate issues)
+        for chrom, reverts in reverts_by_chrom.items():
+            if chrom not in sequences:
+                continue
+
+            seq = sequences[chrom]
+            # Sort by position, descending
+            reverts_sorted = sorted(reverts, key=lambda x: x['pf'].filled_start, reverse=True)
+
+            for revert_info in reverts_sorted:
+                pf = revert_info['pf']
+                result = revert_info['result']
+                n_match = revert_info['n_match']
+
+                # Calculate positions within the fill sequence
+                # pf.sequence structure: left_fill + 500N + right_fill
+                left_fill_end = n_match.start()      # End of left_fill in pf.sequence
+                right_fill_start = n_match.end()     # Start of right_fill in pf.sequence
+
+                # Absolute positions in assembly
+                abs_left_fill_start = pf.filled_start
+                abs_left_fill_end = pf.filled_start + left_fill_end
+                abs_gap_start = abs_left_fill_end
+                abs_gap_end = pf.filled_start + right_fill_start
+                abs_right_fill_start = abs_gap_end
+                abs_right_fill_end = pf.filled_end
+
+                if not result.left_valid and result.right_valid:
+                    # Left failed, right passed
+                    # Keep: right_fill (from abs_right_fill_start to abs_right_fill_end)
+                    # Replace: left_fill + gap with 500N
+                    # New sequence: 500N + right_fill
+
+                    right_fill = seq[abs_right_fill_start:abs_right_fill_end]
+                    new_fill = 'N' * 500 + right_fill
+
+                    seq = seq[:abs_left_fill_start] + new_fill + seq[abs_right_fill_end:]
+
+                    self.logger.info(f"    Partial revert {pf.gap_id}: kept right ({result.right_fill_length}bp), "
+                                   f"reverted left to 500N")
+
+                elif result.left_valid and not result.right_valid:
+                    # Left passed, right failed
+                    # Keep: left_fill (from abs_left_fill_start to abs_left_fill_end)
+                    # Replace: gap + right_fill with 500N
+                    # New sequence: left_fill + 500N
+
+                    left_fill = seq[abs_left_fill_start:abs_left_fill_end]
+                    new_fill = left_fill + 'N' * 500
+
+                    seq = seq[:abs_left_fill_start] + new_fill + seq[abs_right_fill_end:]
+
+                    self.logger.info(f"    Partial revert {pf.gap_id}: kept left ({result.left_fill_length}bp), "
+                                   f"reverted right to 500N")
+
+                # Update checkpoint with the new partial sequence
+                new_sequence = seq[pf.filled_start:pf.filled_start + len(new_fill)]
+                self.checkpoint.add_partial_gap(pf.gap_id, new_sequence)
+
+            sequences[chrom] = seq
+
+        # Write modified assembly
         with open(reverted_assembly, 'w') as f:
             for chrom, seq in sequences.items():
                 f.write(f">{chrom}\n")

@@ -63,6 +63,35 @@ class ValidationResult:
 
 
 @dataclass
+class PartialFillValidationResult:
+    """Result of partial fill validation with independent left/right results"""
+    # Overall result
+    valid: bool  # True if at least one side is valid
+    status: GapStatus
+
+    # Left side validation
+    left_valid: bool = True
+    left_fill_length: int = 0
+    left_avg_coverage: float = 0.0
+    left_junction_coverage: float = 0.0
+    left_zero_coverage_ratio: float = 0.0
+    left_issues: List[str] = field(default_factory=list)
+
+    # Right side validation
+    right_valid: bool = True
+    right_fill_length: int = 0
+    right_avg_coverage: float = 0.0
+    right_junction_coverage: float = 0.0
+    right_zero_coverage_ratio: float = 0.0
+    right_issues: List[str] = field(default_factory=list)
+
+    # Combined metrics
+    avg_coverage: float = 0.0
+    zero_coverage_ratio: float = 0.0
+    reason: str = ""
+
+
+@dataclass
 class FlankAnalysis:
     """Analysis of flanking sequence quality"""
     needs_polish: bool = False
@@ -176,96 +205,168 @@ class GapValidator:
         filled_sequence: str,
         new_gap_start: int,
         new_gap_end: int
-    ) -> ValidationResult:
+    ) -> PartialFillValidationResult:
         """
-        Validate a partially filled gap.
+        Validate a partially filled gap with independent left/right validation.
 
-        Partial fills are validated by checking junctions and coverage,
-        NOT by requiring spanning reads.
-
-        Criteria:
+        Each side (left and right) is validated independently:
         1. Junction coverage >= 5 (where fill meets original sequence)
         2. Average coverage of inserted sequence >= 5
         3. No coverage breakpoints in inserted sequence (zero_cov_ratio < 5%)
+
+        Returns:
+            PartialFillValidationResult with independent left/right results.
+            - If both sides pass: keep entire fill
+            - If one side passes: keep that side, revert the failed side
+            - If both fail: revert entire fill
         """
         bam = self._get_bam(bam_file)
         if bam is None:
-            return ValidationResult(
+            return PartialFillValidationResult(
                 valid=False,
                 status=GapStatus.FAILED,
+                left_valid=False,
+                right_valid=False,
                 reason="Cannot open BAM file"
             )
 
-        issues = []
-        all_stats = []
-
-        # The filled region is from original_gap_start to original_gap_end
-        # (the entire region that was replaced, including the new 500N placeholder)
-        # We need to check:
-        # 1. Left junction: original_gap_start (where fill meets left flank)
-        # 2. Right junction: original_gap_end in new coords (where fill meets right flank)
-        # 3. Inserted sequence coverage (excluding the 500N placeholder)
+        # Initialize result
+        result = PartialFillValidationResult(
+            valid=False,
+            status=GapStatus.FAILED,
+            left_valid=True,
+            right_valid=True
+        )
 
         # Determine filled portions
         # new_gap_start/end are where the 500N placeholder is in the filled sequence
         left_fill_length = new_gap_start - original_gap_start  # Left inserted portion
         right_fill_length = original_gap_end - new_gap_end     # Right inserted portion
 
-        # Check left junction and left inserted sequence
+        result.left_fill_length = left_fill_length
+        result.right_fill_length = right_fill_length
+
+        # =====================================================================
+        # Validate LEFT side independently
+        # =====================================================================
         if left_fill_length > 0:
+            left_issues = []
+
             # Left junction coverage
             left_junction_cov = self._get_junction_coverage(
                 bam, chrom, original_gap_start, window=50
             )
-            if left_junction_cov < self.MIN_JUNCTION_COVERAGE:
-                issues.append(f"Left junction low coverage: {left_junction_cov:.1f}x < {self.MIN_JUNCTION_COVERAGE}")
+            result.left_junction_coverage = left_junction_cov
 
-            # Left inserted sequence
+            if left_junction_cov < self.MIN_JUNCTION_COVERAGE:
+                left_issues.append(f"junction coverage {left_junction_cov:.1f}x < {self.MIN_JUNCTION_COVERAGE}")
+
+            # Left inserted sequence coverage
             left_stats = self._analyze_region(bam, chrom, original_gap_start, new_gap_start)
-            all_stats.append(left_stats)
+            result.left_avg_coverage = left_stats['avg_coverage']
+            result.left_zero_coverage_ratio = left_stats['zero_coverage_ratio']
 
             if left_stats['avg_coverage'] < self.MIN_INSERT_COVERAGE:
-                issues.append(f"Left insert low coverage: {left_stats['avg_coverage']:.1f}x < {self.MIN_INSERT_COVERAGE}")
-            if left_stats['zero_coverage_ratio'] > self.MAX_COVERAGE_GAP_RATIO:
-                issues.append(f"Left insert has coverage gaps: {left_stats['zero_coverage_ratio']*100:.1f}%")
+                left_issues.append(f"avg coverage {left_stats['avg_coverage']:.1f}x < {self.MIN_INSERT_COVERAGE}")
 
-        # Check right junction and right inserted sequence
+            if left_stats['zero_coverage_ratio'] > self.MAX_COVERAGE_GAP_RATIO:
+                left_issues.append(f"coverage gaps {left_stats['zero_coverage_ratio']*100:.1f}%")
+
+            result.left_valid = len(left_issues) == 0
+            result.left_issues = left_issues
+        else:
+            # No left fill - mark as valid (nothing to validate)
+            result.left_valid = True
+            result.left_fill_length = 0
+
+        # =====================================================================
+        # Validate RIGHT side independently
+        # =====================================================================
         if right_fill_length > 0:
-            # Right junction coverage (at the end of the fill, before right flank)
-            # In new assembly, right flank starts at: original_gap_start + len(filled_sequence) - (original_gap_end - original_gap_start) + (original_gap_end - new_gap_end)
-            # Simplified: we check coverage at new_gap_end (end of 500N placeholder)
+            right_issues = []
+
+            # Right junction coverage (at the end of the right fill)
             right_junction_cov = self._get_junction_coverage(
                 bam, chrom, new_gap_end + right_fill_length, window=50
             )
-            if right_junction_cov < self.MIN_JUNCTION_COVERAGE:
-                issues.append(f"Right junction low coverage: {right_junction_cov:.1f}x < {self.MIN_JUNCTION_COVERAGE}")
+            result.right_junction_coverage = right_junction_cov
 
-            # Right inserted sequence
+            if right_junction_cov < self.MIN_JUNCTION_COVERAGE:
+                right_issues.append(f"junction coverage {right_junction_cov:.1f}x < {self.MIN_JUNCTION_COVERAGE}")
+
+            # Right inserted sequence coverage
             right_stats = self._analyze_region(bam, chrom, new_gap_end, new_gap_end + right_fill_length)
-            all_stats.append(right_stats)
+            result.right_avg_coverage = right_stats['avg_coverage']
+            result.right_zero_coverage_ratio = right_stats['zero_coverage_ratio']
 
             if right_stats['avg_coverage'] < self.MIN_INSERT_COVERAGE:
-                issues.append(f"Right insert low coverage: {right_stats['avg_coverage']:.1f}x < {self.MIN_INSERT_COVERAGE}")
+                right_issues.append(f"avg coverage {right_stats['avg_coverage']:.1f}x < {self.MIN_INSERT_COVERAGE}")
+
             if right_stats['zero_coverage_ratio'] > self.MAX_COVERAGE_GAP_RATIO:
-                issues.append(f"Right insert has coverage gaps: {right_stats['zero_coverage_ratio']*100:.1f}%")
+                right_issues.append(f"coverage gaps {right_stats['zero_coverage_ratio']*100:.1f}%")
 
-        valid = len(issues) == 0
+            result.right_valid = len(right_issues) == 0
+            result.right_issues = right_issues
+        else:
+            # No right fill - mark as valid (nothing to validate)
+            result.right_valid = True
+            result.right_fill_length = 0
 
-        # Combined stats
-        avg_cov = 0
-        zero_ratio = 0
-        if all_stats:
-            avg_cov = sum(s['avg_coverage'] for s in all_stats) / len(all_stats)
-            zero_ratio = sum(s['zero_coverage_ratio'] for s in all_stats) / len(all_stats)
+        # =====================================================================
+        # Determine overall result
+        # =====================================================================
+        # Valid if at least one side with actual fill is valid
+        has_left = left_fill_length > 0
+        has_right = right_fill_length > 0
 
-        return ValidationResult(
-            valid=valid,
-            status=GapStatus.FILLED_PARTIAL if valid else GapStatus.FAILED,
-            confidence=0.8 if valid else 0.3,
-            avg_coverage=avg_cov,
-            zero_coverage_ratio=zero_ratio,
-            reason="; ".join(issues) if issues else "Partial fill validated"
-        )
+        if has_left and has_right:
+            # Both sides have fills
+            result.valid = result.left_valid or result.right_valid
+        elif has_left:
+            result.valid = result.left_valid
+        elif has_right:
+            result.valid = result.right_valid
+        else:
+            # No fill on either side (shouldn't happen)
+            result.valid = False
+
+        # Set status
+        if result.left_valid and result.right_valid:
+            result.status = GapStatus.FILLED_PARTIAL
+        elif result.valid:
+            result.status = GapStatus.FILLED_PARTIAL  # Partial success
+        else:
+            result.status = GapStatus.FAILED
+
+        # Combined metrics
+        coverages = []
+        zero_ratios = []
+        if has_left:
+            coverages.append(result.left_avg_coverage)
+            zero_ratios.append(result.left_zero_coverage_ratio)
+        if has_right:
+            coverages.append(result.right_avg_coverage)
+            zero_ratios.append(result.right_zero_coverage_ratio)
+
+        result.avg_coverage = sum(coverages) / len(coverages) if coverages else 0
+        result.zero_coverage_ratio = sum(zero_ratios) / len(zero_ratios) if zero_ratios else 0
+
+        # Build reason string
+        reasons = []
+        if has_left:
+            if result.left_valid:
+                reasons.append(f"Left OK ({left_fill_length}bp, cov={result.left_avg_coverage:.1f}x)")
+            else:
+                reasons.append(f"Left FAIL ({left_fill_length}bp): {'; '.join(result.left_issues)}")
+        if has_right:
+            if result.right_valid:
+                reasons.append(f"Right OK ({right_fill_length}bp, cov={result.right_avg_coverage:.1f}x)")
+            else:
+                reasons.append(f"Right FAIL ({right_fill_length}bp): {'; '.join(result.right_issues)}")
+
+        result.reason = " | ".join(reasons)
+
+        return result
 
     def _get_junction_coverage(self, bam: pysam.AlignmentFile, chrom: str,
                                 position: int, window: int = 50) -> float:
