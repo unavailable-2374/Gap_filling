@@ -49,7 +49,7 @@ def _fill_single_gap(args: tuple) -> Dict:
             threads=1,  # Single thread per worker
             work_dir=config['work_dir'],
             min_mapq=config.get('min_mapq', 20),
-            enable_validation=False,  # Validation is done separately
+            enable_validation=True,  # Local validation runs per worker
         )
 
         # Fill the gap
@@ -223,7 +223,7 @@ def fill_gaps_sequential(gaps: List[Dict],
         threads=threads,
         work_dir=work_dir,
         min_mapq=min_mapq,
-        enable_validation=False,
+        enable_validation=True,  # Local validation runs per fill
     )
 
     results = {}

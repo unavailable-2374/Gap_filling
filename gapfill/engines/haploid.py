@@ -27,8 +27,7 @@ from Bio.SeqRecord import SeqRecord
 from Bio.Seq import Seq
 
 from gapfill.core.filler import GapFiller
-from gapfill.core.validator import (GapValidator, GapStatusTracker, GapStatus, PendingFill,
-                                     PartialFillValidationResult)
+from gapfill.core.validator import GapValidator, GapStatusTracker, GapStatus
 from gapfill.core.parallel import fill_gaps_parallel, fill_gaps_sequential, GapBatcher
 from gapfill.utils.checkpoint import CheckpointManager, CheckpointState
 from gapfill.utils.reads_cache import ReadsCache, GapReadsExtractor
@@ -178,10 +177,7 @@ class HaploidEngine:
                     start_iteration = i
                     # Use the filled assembly from this iteration
                     filled_asm = iter_dir / "assembly_filled.fasta"
-                    reverted_asm = iter_dir / "assembly_reverted.fasta"
-                    if reverted_asm.exists():
-                        current_assembly = reverted_asm
-                    elif filled_asm.exists():
+                    if filled_asm.exists():
                         current_assembly = filled_asm
                     self.logger.info(f"  Last completed iteration: {i}")
                     break
@@ -217,12 +213,8 @@ class HaploidEngine:
             # Check if this iteration is already complete
             if _is_done(iter_dir, "iteration"):
                 self.logger.info("  Iteration already complete, skipping...")
-                # Load assembly from this iteration
-                reverted_asm = iter_dir / "assembly_reverted.fasta"
                 filled_asm = iter_dir / "assembly_filled.fasta"
-                if reverted_asm.exists():
-                    current_assembly = reverted_asm
-                elif filled_asm.exists():
+                if filled_asm.exists():
                     current_assembly = filled_asm
                 continue
 
@@ -277,39 +269,8 @@ class HaploidEngine:
                 self.logger.error("No BAM files generated")
                 break
 
-            # Step 2: Validate previous iteration's fills (if any)
-            if not _is_done(iter_dir, "validation"):
-                assembly_before_validation = current_assembly
-                if iteration > 1:
-                    pending_fills = self.gap_tracker.get_pending_fills()
-                    if pending_fills:
-                        self.logger.info(f"Step 2: Validating {len(pending_fills)} fills from previous iteration...")
-                        current_assembly = self._validate_previous_fills(
-                            current_assembly, pending_fills, hifi_bam, ont_bam, iter_dir
-                        )
-
-                        # If assembly changed (reverts occurred), re-align reads
-                        if current_assembly != assembly_before_validation:
-                            self.logger.info("Step 2b: Re-aligning reads to reverted assembly...")
-                            # Clear alignment.ok since we need to re-align
-                            _clear_marker(iter_dir, "alignment")
-                            if self.optimized_mode and self.reads_cache:
-                                hifi_bam, ont_bam = self._align_filtered_reads(current_assembly, iter_dir)
-                            else:
-                                hifi_bam, ont_bam = self._align_reads_with_cache(current_assembly, iter_dir)
-                            _mark_done(iter_dir, "alignment")
-
-                _mark_done(iter_dir, "validation")
-                self._save_gap_tracker()
-            else:
-                self.logger.info("Step 2: Validation already done, skipping...")
-                # Check if there's a reverted assembly from previous validation
-                reverted_asm = iter_dir / "assembly_reverted.fasta"
-                if reverted_asm.exists():
-                    current_assembly = reverted_asm
-
-            # Step 3: Find gaps
-            self.logger.info("Step 3: Finding gaps...")
+            # Step 2: Find gaps
+            self.logger.info("Step 2: Finding gaps...")
             gaps = self._find_gaps(current_assembly)
 
             # Use gap tracker to determine which gaps to attempt
@@ -327,9 +288,9 @@ class HaploidEngine:
                 self.logger.info("No remaining gaps, stopping")
                 break
 
-            # Step 4: Fill gaps
+            # Step 3: Fill gaps (with local validation inside each fill)
             if not _is_done(iter_dir, "filling"):
-                self.logger.info("Step 4: Filling gaps...")
+                self.logger.info("Step 3: Filling gaps (with local validation)...")
                 work_dir = iter_dir / "work"
                 work_dir.mkdir(exist_ok=True)
 
@@ -383,9 +344,9 @@ class HaploidEngine:
 
                     gap_filler.close()
 
-                # Step 5: Process fill results (with HIGH-CONFIDENCE IMMEDIATE VALIDATION)
-                new_pending = 0
-                new_complete = 0  # High-confidence fills that skip delayed validation
+                # Step 4: Process fill results (all locally validated)
+                new_complete = 0
+                new_partial = 0
                 new_unfillable = 0
                 new_failed = 0
 
@@ -396,50 +357,56 @@ class HaploidEngine:
                     gap = data['gap']
                     result = data['result']
 
-                    if result.get('success'):
-                        # Fill succeeded
+                    if result.get('success') and result.get('validated', False):
+                        # Fill succeeded and passed local validation
                         successful_fills[gap_name] = data
                         is_complete = result.get('is_complete', False) and not result.get('has_placeholder', False)
-
-                        # Check if this fill can skip delayed validation (high confidence)
-                        validation = result.get('validation', {})
-                        skip_delayed = validation.get('skip_delayed_validation', False)
 
                         fill_seq = result.get('sequence', '')
                         fill_length = len(fill_seq)
                         original_gap_size = gap['end'] - gap['start']
 
-                        if skip_delayed and is_complete:
-                            # HIGH CONFIDENCE: Mark as FILLED_COMPLETE immediately
+                        if is_complete:
                             new_complete += 1
                             self.gap_tracker.set_status(
                                 gap_name, GapStatus.FILLED_COMPLETE,
-                                f"High-confidence fill: {result.get('source', 'unknown')} "
-                                f"(tier={result.get('tier', 0)}, cov={validation.get('avg_coverage', 0):.1f}x)"
+                                f"Locally validated: {result.get('source', 'unknown')} "
+                                f"(tier={result.get('tier', 0)})"
                             )
-                            self.checkpoint.add_completed_gap(gap_name, fill_seq)
                             self.logger.info(f"    {gap_name}: ✓ filled & validated "
                                            f"({result.get('source', 'unknown')}, "
                                            f"{original_gap_size}bp -> {fill_length}bp)")
                         else:
-                            # Standard: Mark as PENDING validation
-                            new_pending += 1
-                            self.gap_tracker.add_pending_fill(
-                                gap_id=gap_name,
-                                chrom=gap['chrom'],
-                                original_start=gap['start'],
-                                original_end=gap['end'],
-                                filled_start=gap['start'],
-                                filled_end=gap['start'] + fill_length,
-                                sequence=fill_seq,
-                                is_complete=is_complete,
-                                source=result.get('source', 'unknown'),
-                                tier=result.get('tier', 0)
+                            # Handle partial fill — truncate failed sides
+                            partial_val = result.get('validation', {})
+                            if not partial_val.get('left_valid', True) or not partial_val.get('right_valid', True):
+                                fill_seq = self._truncate_partial_fill(fill_seq, partial_val)
+                                result['sequence'] = fill_seq
+                                data['result'] = result
+                            new_partial += 1
+                            self.gap_tracker.set_status(
+                                gap_name, GapStatus.FILLED_PARTIAL,
+                                f"Locally validated (partial): {result.get('source', 'unknown')} "
+                                f"(tier={result.get('tier', 0)})"
                             )
-                            self.logger.info(f"    {gap_name}: filled ({result.get('source', 'unknown')}, "
-                                           f"{original_gap_size}bp -> {fill_length}bp), pending validation")
+                            self.logger.info(f"    {gap_name}: ✓ partially filled & validated "
+                                           f"({result.get('source', 'unknown')}, "
+                                           f"{original_gap_size}bp -> {fill_length}bp)")
+
+                        self.checkpoint.add_completed_gap(gap_name, result.get('sequence', ''))
+
+                    elif result.get('success'):
+                        # Assembled but all tiers failed validation
+                        new_failed += 1
+                        self.gap_tracker.set_status(
+                            gap_name, GapStatus.FAILED,
+                            "All tiers failed local validation"
+                        )
+                        failed_gaps.add(gap_name)
+                        self.checkpoint.add_failed_gap(gap_name)
+
                     else:
-                        # Fill failed → analyze why
+                        # Fill failed entirely → analyze why
                         validation = result.get('validation', {})
                         validation_status = validation.get('status', '')
 
@@ -459,8 +426,8 @@ class HaploidEngine:
                         failed_gaps.add(gap_name)
                         self.checkpoint.add_failed_gap(gap_name)
 
-                self.logger.info(f"  Filled (confirmed): {new_complete}, "
-                               f"Filled (pending validation): {new_pending}, "
+                self.logger.info(f"  Complete fills: {new_complete}, "
+                               f"Partial fills: {new_partial}, "
                                f"Unfillable: {new_unfillable}, Failed: {new_failed}")
 
                 # Save fill results for potential resume
@@ -468,39 +435,27 @@ class HaploidEngine:
                 self._save_gap_tracker()
                 _mark_done(iter_dir, "filling")
             else:
-                self.logger.info("Step 4-5: Filling already done, loading results...")
-                # Load fill results from saved stats
-                stats_file = iter_dir / "iteration_stats.json"
+                self.logger.info("Step 3-4: Filling already done")
+                # If filling is done but apply is not done, this is an inconsistent state.
+                if not _is_done(iter_dir, "apply"):
+                    self.logger.warning("  Apply step not done but filling done - inconsistent state")
+                    self.logger.warning("  Re-running filling to get actual sequences...")
+                    _clear_marker(iter_dir, "filling")
+                    continue
                 successful_fills = {}
-                if stats_file.exists():
-                    with open(stats_file) as f:
-                        saved_stats = json.load(f)
-                    for fill_info in saved_stats.get('successful_fills', []):
-                        gap_name = fill_info['gap_name']
-                        # Reconstruct minimal fill data for apply step
-                        successful_fills[gap_name] = {
-                            'gap': {
-                                'chrom': fill_info['chrom'],
-                                'start': fill_info['original_start'],
-                                'end': fill_info['original_end'],
-                                'name': gap_name
-                            },
-                            'result': {
-                                'success': True,
-                                'sequence': 'N' * fill_info['fill_length']  # Placeholder, actual seq in assembly
-                            }
-                        }
+                new_complete = 0
+                new_partial = 0
 
-            # Step 6: Apply fills to assembly
+            # Step 5: Apply fills to assembly
             if not _is_done(iter_dir, "apply"):
                 if successful_fills:
-                    self.logger.info("Step 6: Applying fills to assembly...")
+                    self.logger.info("Step 5: Applying fills to assembly...")
                     current_assembly = self._apply_fills(
                         current_assembly, successful_fills, iter_dir
                     )
                 _mark_done(iter_dir, "apply")
             else:
-                self.logger.info("Step 6: Apply already done, loading assembly...")
+                self.logger.info("Step 5: Apply already done, loading assembly...")
                 filled_asm = iter_dir / "assembly_filled.fasta"
                 if filled_asm.exists():
                     current_assembly = filled_asm
@@ -513,9 +468,8 @@ class HaploidEngine:
             self._save_gap_tracker()
             _mark_done(iter_dir, "iteration")
 
-            # Check for progress (no new fills and no pending validation)
-            pending_count = len(self.gap_tracker.get_pending_fills())
-            if new_pending == 0 and pending_count == 0:
+            # Check for progress
+            if new_complete + new_partial == 0:
                 self.logger.info("No progress in this iteration, stopping")
                 break
 
@@ -733,325 +687,26 @@ class HaploidEngine:
 
         return current_assembly
 
-    def _validate_previous_fills(self,
-                                  assembly: Path,
-                                  pending_fills: Dict,
-                                  hifi_bam: Optional[Path],
-                                  ont_bam: Optional[Path],
-                                  output_dir: Path) -> Path:
+    def _truncate_partial_fill(self, fill_seq: str, validation: Dict) -> str:
         """
-        Validate fills from previous iteration using current BAM.
+        Truncate a partial fill string by removing the side(s) that failed validation.
 
-        For each pending fill:
-        - If validation passes → mark as FILLED_COMPLETE/PARTIAL
-        - If validation fails → revert the fill (restore gap)
-
-        Returns:
-            Path to assembly (may be modified if fills reverted)
+        Operates on the fill string BEFORE it is applied to the assembly.
         """
-        validator = GapValidator(threads=self.threads)
+        n_match = re.search(r'N{10,}', fill_seq)
+        if not n_match:
+            return fill_seq
 
-        # Prefer HiFi BAM for validation
-        bam_file = None
-        if hifi_bam and hifi_bam.exists():
-            bam_file = str(hifi_bam)
-        elif ont_bam and ont_bam.exists():
-            bam_file = str(ont_bam)
+        left = fill_seq[:n_match.start()]
+        gap = fill_seq[n_match.start():n_match.end()]
+        right = fill_seq[n_match.end():]
 
-        if not bam_file:
-            self.logger.warning("  No BAM for validation, accepting all fills")
-            for gap_id, pf in pending_fills.items():
-                if pf.is_complete:
-                    self.gap_tracker.set_status(gap_id, GapStatus.FILLED_COMPLETE,
-                                               "Accepted without validation (no BAM)")
-                else:
-                    self.gap_tracker.set_status(gap_id, GapStatus.FILLED_PARTIAL,
-                                               "Accepted without validation (no BAM)")
-            validator.close()
-            return assembly
+        if not validation.get('left_valid', True):
+            left = ''
+        if not validation.get('right_valid', True):
+            right = ''
 
-        validated_count = 0
-        failed_count = 0
-        fills_to_revert = []
-
-        # Track different types of reverts
-        full_reverts = []      # Completely failed fills
-        partial_reverts = []   # Partial fills where one side failed
-
-        try:
-            for gap_id, pf in pending_fills.items():
-                self.logger.info(f"    Validating {gap_id}...")
-
-                fill_length = pf.filled_end - pf.filled_start
-
-                # Validate based on fill type
-                if pf.is_complete:
-                    # Complete fills: require spanning reads
-                    result = validator.validate_complete_fill(
-                        bam_file, pf.chrom, pf.filled_start, pf.filled_end, pf.sequence
-                    )
-
-                    if result.valid:
-                        validated_count += 1
-                        self.gap_tracker.set_status(gap_id, GapStatus.FILLED_COMPLETE,
-                                                   f"Validated: {result.reason}")
-                        self.checkpoint.add_completed_gap(gap_id, pf.sequence)
-                        self.logger.info(f"      ✓ Validated {fill_length}bp complete fill "
-                                       f"(cov={result.avg_coverage:.1f}x, spanning={result.spanning_reads})")
-                    else:
-                        failed_count += 1
-                        full_reverts.append(pf)
-                        self.gap_tracker.set_status(gap_id, GapStatus.FAILED,
-                                                   f"Validation failed: {result.reason}")
-                        self.logger.warning(f"      ✗ Failed {fill_length}bp complete fill: {result.reason}")
-                else:
-                    # Partial fills: check junctions and coverage independently for each side
-                    n_match = re.search(r'N{100,}', pf.sequence)
-                    if n_match:
-                        new_gap_start = pf.filled_start + n_match.start()
-                        new_gap_end = pf.filled_start + n_match.end()
-
-                        result = validator.validate_partial_fill(
-                            bam_file, pf.chrom,
-                            pf.original_start, pf.original_end,
-                            pf.sequence,
-                            new_gap_start, new_gap_end
-                        )
-
-                        # Handle independent left/right validation
-                        if isinstance(result, PartialFillValidationResult):
-                            if result.left_valid and result.right_valid:
-                                # Both sides passed
-                                validated_count += 1
-                                self.gap_tracker.set_status(gap_id, GapStatus.FILLED_PARTIAL,
-                                                           f"Validated: {result.reason}")
-                                self.checkpoint.add_partial_gap(gap_id, pf.sequence)
-                                self.logger.info(f"      ✓ Validated {fill_length}bp partial fill: {result.reason}")
-
-                            elif result.left_valid or result.right_valid:
-                                # One side passed, one failed - partial revert
-                                validated_count += 1  # Count as partial success
-                                partial_reverts.append({
-                                    'pf': pf,
-                                    'result': result,
-                                    'n_match': n_match,
-                                    'new_gap_start': new_gap_start,
-                                    'new_gap_end': new_gap_end
-                                })
-                                side_kept = "left" if result.left_valid else "right"
-                                side_failed = "right" if result.left_valid else "left"
-                                self.gap_tracker.set_status(gap_id, GapStatus.FILLED_PARTIAL,
-                                                           f"Partial: {side_kept} OK, {side_failed} reverted")
-                                self.logger.info(f"      ⚠ Partial validation: {result.reason}")
-                                self.logger.info(f"        Keeping {side_kept} side, reverting {side_failed} side")
-
-                            else:
-                                # Both sides failed
-                                failed_count += 1
-                                full_reverts.append(pf)
-                                self.gap_tracker.set_status(gap_id, GapStatus.FAILED,
-                                                           f"Validation failed: {result.reason}")
-                                self.logger.warning(f"      ✗ Failed {fill_length}bp partial fill: {result.reason}")
-                        else:
-                            # Fallback for non-PartialFillValidationResult
-                            if result.valid:
-                                validated_count += 1
-                                self.gap_tracker.set_status(gap_id, GapStatus.FILLED_PARTIAL,
-                                                           f"Validated: {result.reason}")
-                                self.checkpoint.add_partial_gap(gap_id, pf.sequence)
-                                self.logger.info(f"      ✓ Validated {fill_length}bp partial fill")
-                            else:
-                                failed_count += 1
-                                full_reverts.append(pf)
-                                self.gap_tracker.set_status(gap_id, GapStatus.FAILED,
-                                                           f"Validation failed: {result.reason}")
-                                self.logger.warning(f"      ✗ Failed {fill_length}bp partial fill: {result.reason}")
-                    else:
-                        # No N-run found but marked as partial - treat as complete
-                        result = validator.validate_complete_fill(
-                            bam_file, pf.chrom, pf.filled_start, pf.filled_end, pf.sequence
-                        )
-                        if result.valid:
-                            validated_count += 1
-                            self.gap_tracker.set_status(gap_id, GapStatus.FILLED_COMPLETE,
-                                                       f"Validated: {result.reason}")
-                            self.checkpoint.add_completed_gap(gap_id, pf.sequence)
-                            self.logger.info(f"      ✓ Validated {fill_length}bp fill")
-                        else:
-                            failed_count += 1
-                            full_reverts.append(pf)
-                            self.gap_tracker.set_status(gap_id, GapStatus.FAILED,
-                                                       f"Validation failed: {result.reason}")
-                            self.logger.warning(f"      ✗ Failed {fill_length}bp fill: {result.reason}")
-
-        finally:
-            validator.close()
-
-        self.logger.info(f"  Validation complete: {validated_count} passed, {failed_count} failed")
-
-        # Apply reverts
-        if full_reverts:
-            self.logger.info(f"  Reverting {len(full_reverts)} fully failed fills...")
-            assembly = self._revert_fills(assembly, full_reverts, output_dir)
-
-        if partial_reverts:
-            self.logger.info(f"  Applying {len(partial_reverts)} partial reverts...")
-            assembly = self._partial_revert_fills(assembly, partial_reverts, output_dir)
-
-        return assembly
-
-    def _revert_fills(self, assembly: Path, fills_to_revert: List, output_dir: Path) -> Path:
-        """
-        Revert failed fills by restoring the original gap (500N).
-
-        This is necessary when a fill fails validation - we need to
-        restore the gap so it can be retried in future iterations.
-        """
-        if not fills_to_revert:
-            return assembly
-
-        reverted_assembly = output_dir / "assembly_reverted.fasta"
-
-        # Load assembly
-        sequences = {}
-        for record in SeqIO.parse(assembly, 'fasta'):
-            sequences[record.id] = str(record.seq)
-
-        # Revert each failed fill (process from end to avoid coordinate shift)
-        fills_by_chrom = {}
-        for pf in fills_to_revert:
-            if pf.chrom not in fills_by_chrom:
-                fills_by_chrom[pf.chrom] = []
-            fills_by_chrom[pf.chrom].append(pf)
-
-        for chrom, fills in fills_by_chrom.items():
-            if chrom not in sequences:
-                continue
-
-            seq = sequences[chrom]
-            # Sort by position, descending
-            fills_sorted = sorted(fills, key=lambda x: x.filled_start, reverse=True)
-
-            for pf in fills_sorted:
-                # Replace filled region with 500N gap
-                seq = seq[:pf.filled_start] + 'N' * 500 + seq[pf.filled_end:]
-                self.logger.info(f"    Reverted {pf.gap_id}: restored 500N gap")
-
-            sequences[chrom] = seq
-
-        # Write reverted assembly
-        with open(reverted_assembly, 'w') as f:
-            for chrom, seq in sequences.items():
-                f.write(f">{chrom}\n")
-                for i in range(0, len(seq), 80):
-                    f.write(seq[i:i+80] + '\n')
-
-        return reverted_assembly
-
-    def _partial_revert_fills(self, assembly: Path, partial_reverts: List[Dict],
-                               output_dir: Path) -> Path:
-        """
-        Partially revert fills where one side passed and one side failed.
-
-        For each partial revert:
-        - If left failed, right passed: keep right_fill, replace left_fill+gap with 500N
-        - If right failed, left passed: keep left_fill, replace gap+right_fill with 500N
-
-        Args:
-            assembly: Current assembly file
-            partial_reverts: List of dicts with 'pf', 'result', 'n_match', etc.
-            output_dir: Output directory
-
-        Returns:
-            Path to modified assembly
-        """
-        if not partial_reverts:
-            return assembly
-
-        reverted_assembly = output_dir / "assembly_partial_reverted.fasta"
-
-        # Load assembly
-        sequences = {}
-        for record in SeqIO.parse(assembly, 'fasta'):
-            sequences[record.id] = str(record.seq)
-
-        # Group by chromosome
-        reverts_by_chrom = {}
-        for revert_info in partial_reverts:
-            pf = revert_info['pf']
-            if pf.chrom not in reverts_by_chrom:
-                reverts_by_chrom[pf.chrom] = []
-            reverts_by_chrom[pf.chrom].append(revert_info)
-
-        # Process each chromosome (from end to start to avoid coordinate issues)
-        for chrom, reverts in reverts_by_chrom.items():
-            if chrom not in sequences:
-                continue
-
-            seq = sequences[chrom]
-            # Sort by position, descending
-            reverts_sorted = sorted(reverts, key=lambda x: x['pf'].filled_start, reverse=True)
-
-            for revert_info in reverts_sorted:
-                pf = revert_info['pf']
-                result = revert_info['result']
-                n_match = revert_info['n_match']
-
-                # Calculate positions within the fill sequence
-                # pf.sequence structure: left_fill + 500N + right_fill
-                left_fill_end = n_match.start()      # End of left_fill in pf.sequence
-                right_fill_start = n_match.end()     # Start of right_fill in pf.sequence
-
-                # Absolute positions in assembly
-                abs_left_fill_start = pf.filled_start
-                abs_left_fill_end = pf.filled_start + left_fill_end
-                abs_gap_start = abs_left_fill_end
-                abs_gap_end = pf.filled_start + right_fill_start
-                abs_right_fill_start = abs_gap_end
-                abs_right_fill_end = pf.filled_end
-
-                if not result.left_valid and result.right_valid:
-                    # Left failed, right passed
-                    # Keep: right_fill (from abs_right_fill_start to abs_right_fill_end)
-                    # Replace: left_fill + gap with 500N
-                    # New sequence: 500N + right_fill
-
-                    right_fill = seq[abs_right_fill_start:abs_right_fill_end]
-                    new_fill = 'N' * 500 + right_fill
-
-                    seq = seq[:abs_left_fill_start] + new_fill + seq[abs_right_fill_end:]
-
-                    self.logger.info(f"    Partial revert {pf.gap_id}: kept right ({result.right_fill_length}bp), "
-                                   f"reverted left to 500N")
-
-                elif result.left_valid and not result.right_valid:
-                    # Left passed, right failed
-                    # Keep: left_fill (from abs_left_fill_start to abs_left_fill_end)
-                    # Replace: gap + right_fill with 500N
-                    # New sequence: left_fill + 500N
-
-                    left_fill = seq[abs_left_fill_start:abs_left_fill_end]
-                    new_fill = left_fill + 'N' * 500
-
-                    seq = seq[:abs_left_fill_start] + new_fill + seq[abs_right_fill_end:]
-
-                    self.logger.info(f"    Partial revert {pf.gap_id}: kept left ({result.left_fill_length}bp), "
-                                   f"reverted right to 500N")
-
-                # Update checkpoint with the new partial sequence
-                new_sequence = seq[pf.filled_start:pf.filled_start + len(new_fill)]
-                self.checkpoint.add_partial_gap(pf.gap_id, new_sequence)
-
-            sequences[chrom] = seq
-
-        # Write modified assembly
-        with open(reverted_assembly, 'w') as f:
-            for chrom, seq in sequences.items():
-                f.write(f">{chrom}\n")
-                for i in range(0, len(seq), 80):
-                    f.write(seq[i:i+80] + '\n')
-
-        return reverted_assembly
+        return left + gap + right
 
     def _find_gaps(self, assembly_file: Path) -> List[Dict]:
         """Find gaps (N-runs) in assembly, with caching"""
@@ -1155,11 +810,10 @@ class HaploidEngine:
 
     def _apply_fills(self, assembly: Path, fill_results: Dict, output_dir: Path) -> Path:
         """
-        Apply gap fills to assembly and update pending fill coordinates.
+        Apply locally-validated gap fills to assembly.
 
         Fills are applied from end to start to avoid coordinate shifts affecting
-        fills yet to be applied. After applying, we update the pending fills'
-        coordinates to reflect their actual positions in the new assembly.
+        fills yet to be applied.
         """
         filled_assembly = output_dir / "assembly_filled.fasta"
 
@@ -1168,28 +822,22 @@ class HaploidEngine:
         for record in SeqIO.parse(assembly, 'fasta'):
             sequences[record.id] = str(record.seq)
 
-        # Group fills by chromosome with gap names for tracking
+        # Group fills by chromosome
         fills_by_chrom = {}
         for gap_name, data in fill_results.items():
-            if not data['result']['success']:
+            if not data['result'].get('success'):
                 continue
             gap = data['gap']
             chrom = gap['chrom']
             if chrom not in fills_by_chrom:
                 fills_by_chrom[chrom] = []
             fills_by_chrom[chrom].append({
-                'gap_name': gap_name,
                 'start': gap['start'],
                 'end': gap['end'],
                 'sequence': data['result']['sequence'],
-                'fill_length': len(data['result']['sequence'])
             })
 
-        # Track coordinate shifts per chromosome for updating pending fills
-        # Key: (chrom, original_start) -> new_start, new_end
-        coordinate_updates = {}
-
-        # Apply fills (from end to start) and track coordinate shifts
+        # Apply fills (from end to start)
         for chrom, fills in fills_by_chrom.items():
             if chrom not in sequences:
                 continue
@@ -1197,40 +845,10 @@ class HaploidEngine:
             seq = sequences[chrom]
             fills_sorted = sorted(fills, key=lambda x: x['start'], reverse=True)
 
-            # Track cumulative offset for this chromosome
-            cumulative_offset = 0
-
             for fill in fills_sorted:
-                original_start = fill['start']
-                original_end = fill['end']
-                fill_seq = fill['sequence']
-                fill_length = len(fill_seq)
-                gap_length = original_end - original_start
-
-                # Apply fill
-                seq = seq[:original_start] + fill_seq + seq[original_end:]
-
-                # Calculate actual position in new assembly
-                # Since we're going from end to start, this fill's position is not affected
-                # by previous fills in this loop (they were all after this one)
-                actual_start = original_start
-                actual_end = original_start + fill_length
-
-                # Store the coordinate update
-                coordinate_updates[(chrom, original_start, original_end)] = (actual_start, actual_end)
+                seq = seq[:fill['start']] + fill['sequence'] + seq[fill['end']:]
 
             sequences[chrom] = seq
-
-        # Update pending fills with correct coordinates
-        pending_fills = self.gap_tracker.get_pending_fills()
-        for gap_id, pf in pending_fills.items():
-            key = (pf.chrom, pf.original_start, pf.original_end)
-            if key in coordinate_updates:
-                new_start, new_end = coordinate_updates[key]
-                # Update the pending fill's coordinates
-                pf.filled_start = new_start
-                pf.filled_end = new_end
-                self.logger.debug(f"    Updated {gap_id} coordinates: {pf.original_start}-{pf.original_end} -> {new_start}-{new_end}")
 
         # Write filled assembly
         with open(filled_assembly, 'w') as f:
@@ -1326,8 +944,8 @@ class HaploidEngine:
             with open(self.gap_tracker_file) as f:
                 tracker_data = json.load(f)
             self.gap_tracker = GapStatusTracker.from_dict(tracker_data)
-            pending_count = len(self.gap_tracker.get_pending_fills())
-            self.logger.info(f"Loaded gap tracker state: {pending_count} pending fills")
+            summary = self.gap_tracker.get_summary()
+            self.logger.info(f"Loaded gap tracker state: {summary}")
             return True
         except Exception as e:
             self.logger.warning(f"Failed to load gap tracker: {e}")

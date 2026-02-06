@@ -11,14 +11,16 @@ Key responsibilities:
 
 import logging
 import re
+import subprocess
 from enum import Enum
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from collections import defaultdict
 
 import pysam
 import numpy as np
+from Bio import SeqIO
 
 
 class GapStatus(Enum):
@@ -367,6 +369,184 @@ class GapValidator:
         result.reason = " | ".join(reasons)
 
         return result
+
+    def validate_fill_locally(self, hifi_bam, ont_bam, assembly_file, chrom,
+                              gap_start, gap_end, fill_sequence, is_complete,
+                              work_dir, threads=1, flank_size=5000):
+        """
+        Validate a fill by constructing a local reference and aligning nearby reads.
+
+        Instead of relying on the next iteration's BAM (delayed validation), this
+        builds a small reference (flank + fill + flank), extracts nearby reads from
+        the current BAM(s), aligns them locally, and validates.
+
+        Args:
+            hifi_bam: Path to HiFi BAM (or None)
+            ont_bam: Path to ONT BAM (or None)
+            assembly_file: Path to current assembly FASTA
+            chrom: Chromosome name
+            gap_start: Gap start position in assembly
+            gap_end: Gap end position in assembly
+            fill_sequence: The fill sequence to validate
+            is_complete: True if complete fill (no N placeholder)
+            work_dir: Working directory for temp files
+            threads: Threads for minimap2
+            flank_size: Flank size to extract (default 5000)
+
+        Returns:
+            ValidationResult or PartialFillValidationResult, or None on error
+        """
+        work_dir = Path(work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Extract flanks from assembly
+            assembly_seqs = {}
+            for record in SeqIO.parse(assembly_file, 'fasta'):
+                if record.id == chrom:
+                    assembly_seqs[record.id] = str(record.seq)
+                    break
+
+            if chrom not in assembly_seqs:
+                self.logger.warning(f"Chromosome {chrom} not found in assembly")
+                return None
+
+            seq = assembly_seqs[chrom]
+            left_start = max(0, gap_start - flank_size)
+            left_flank = seq[left_start:gap_start]
+            right_flank = seq[gap_end:gap_end + flank_size]
+
+            # Build local reference: left_flank + fill_sequence + right_flank
+            local_ref_seq = left_flank + fill_sequence + right_flank
+            local_ref_file = work_dir / "local_ref.fa"
+            with open(local_ref_file, 'w') as f:
+                f.write(f">local_ref\n{local_ref_seq}\n")
+
+            # Extract reads from BAM(s) in region around the gap
+            local_reads_file = work_dir / "local_reads.fa"
+            read_count = self._extract_reads_from_bams(
+                hifi_bam, ont_bam, chrom,
+                max(0, gap_start - flank_size),
+                gap_end + flank_size,
+                local_reads_file
+            )
+
+            if read_count < 1:
+                self.logger.debug(f"  No reads extracted for local validation")
+                return None
+
+            # Align reads to local reference
+            local_bam_file = work_dir / "local.bam"
+            align_cmd = (
+                f"minimap2 -ax map-hifi -t {threads} "
+                f"{local_ref_file} {local_reads_file} | "
+                f"samtools sort -@ {threads} -o {local_bam_file} - && "
+                f"samtools index {local_bam_file}"
+            )
+            result = subprocess.run(
+                align_cmd, shell=True, capture_output=True, text=True, timeout=120
+            )
+            if result.returncode != 0:
+                self.logger.debug(f"  Local alignment failed: {result.stderr[:200]}")
+                return None
+
+            # Compute local coordinates
+            fill_start_local = len(left_flank)
+            fill_end_local = len(left_flank) + len(fill_sequence)
+
+            local_bam_str = str(local_bam_file)
+
+            if is_complete:
+                # Complete fill validation
+                validation = self.validate_complete_fill(
+                    local_bam_str, "local_ref",
+                    fill_start_local, fill_end_local,
+                    fill_sequence
+                )
+                return validation
+            else:
+                # Partial fill — find N-run position in fill_sequence
+                n_match = re.search(r'N{10,}', fill_sequence)
+                if n_match:
+                    # N-run positions in local ref coordinates
+                    new_gap_start_local = fill_start_local + n_match.start()
+                    new_gap_end_local = fill_start_local + n_match.end()
+
+                    validation = self.validate_partial_fill(
+                        local_bam_str, "local_ref",
+                        fill_start_local, fill_end_local,
+                        fill_sequence,
+                        new_gap_start_local, new_gap_end_local
+                    )
+                    return validation
+                else:
+                    # No N-run but marked partial — validate as complete
+                    validation = self.validate_complete_fill(
+                        local_bam_str, "local_ref",
+                        fill_start_local, fill_end_local,
+                        fill_sequence
+                    )
+                    return validation
+
+        except Exception as e:
+            self.logger.warning(f"Local validation error: {e}")
+            return None
+        finally:
+            # Close any BAM handles opened for local validation
+            local_bam_str = str(work_dir / "local.bam")
+            if local_bam_str in self._bam_handles:
+                try:
+                    self._bam_handles[local_bam_str].close()
+                except:
+                    pass
+                del self._bam_handles[local_bam_str]
+
+    def _extract_reads_from_bams(self, hifi_bam, ont_bam, chrom,
+                                  region_start, region_end,
+                                  output_file) -> int:
+        """
+        Extract read sequences from BAM file(s) in a region.
+
+        Args:
+            hifi_bam: Path to HiFi BAM (or None)
+            ont_bam: Path to ONT BAM (or None)
+            chrom: Chromosome name
+            region_start: Region start
+            region_end: Region end
+            output_file: Output FASTA file
+
+        Returns:
+            Number of reads extracted
+        """
+        read_count = 0
+        seen_names = set()
+
+        with open(output_file, 'w') as f:
+            for bam_path in [hifi_bam, ont_bam]:
+                if not bam_path:
+                    continue
+                bam_path = str(bam_path)
+
+                try:
+                    with pysam.AlignmentFile(bam_path, 'rb') as bam:
+                        if chrom not in bam.references:
+                            continue
+
+                        for read in bam.fetch(chrom, region_start, region_end):
+                            if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                                continue
+                            if read.query_name in seen_names:
+                                continue
+
+                            seq = read.query_sequence
+                            if seq and len(seq) >= 100:
+                                f.write(f">{read.query_name}\n{seq}\n")
+                                read_count += 1
+                                seen_names.add(read.query_name)
+                except Exception as e:
+                    self.logger.debug(f"  Error extracting reads from {bam_path}: {e}")
+
+        return read_count
 
     def _get_junction_coverage(self, bam: pysam.AlignmentFile, chrom: str,
                                 position: int, window: int = 50) -> float:
@@ -815,7 +995,11 @@ class GapValidator:
 
 @dataclass
 class PendingFill:
-    """Information about a fill awaiting validation"""
+    """Information about a fill awaiting validation.
+
+    DEPRECATED: Retained for backwards compatibility with old checkpoint files.
+    The validate-before-apply architecture no longer uses pending fills.
+    """
     gap_id: str
     chrom: str
     original_start: int
@@ -832,16 +1016,13 @@ class GapStatusTracker:
     """
     Tracks gap status across iterations.
 
-    Key features:
-    - Tracks FILLED_PENDING gaps awaiting validation
-    - Stores fill information for delayed validation
-    - Ensures unfillable gaps are skipped
+    With the validate-before-apply architecture, fills are validated locally
+    before being applied. No more pending fills or delayed validation.
     """
 
     def __init__(self):
         self._status: Dict[str, GapStatus] = {}
         self._history: Dict[str, List[str]] = defaultdict(list)
-        self._pending_fills: Dict[str, PendingFill] = {}  # gap_id -> fill info
         self.logger = logging.getLogger(__name__)
 
     def get_status(self, gap_id: str) -> GapStatus:
@@ -856,54 +1037,13 @@ class GapStatusTracker:
         if status == GapStatus.UNFILLABLE:
             self.logger.info(f"Gap {gap_id} marked as UNFILLABLE - will skip in future iterations")
 
-        # Clear pending fill info if status changes from FILLED_PENDING
-        if status != GapStatus.FILLED_PENDING and gap_id in self._pending_fills:
-            del self._pending_fills[gap_id]
-
-    def add_pending_fill(self, gap_id: str, chrom: str,
-                         original_start: int, original_end: int,
-                         filled_start: int, filled_end: int,
-                         sequence: str, is_complete: bool,
-                         source: str, tier: int):
-        """
-        Add a fill that needs validation in next iteration.
-
-        Args:
-            gap_id: Gap identifier
-            chrom: Chromosome name
-            original_start/end: Original gap coordinates (before fill)
-            filled_start/end: New coordinates (after fill applied)
-            sequence: The filled sequence
-            is_complete: True if completely filled (no N placeholder)
-            source: Fill source (e.g., "hifi_spanning")
-            tier: Fill tier (1-6)
-        """
-        self._pending_fills[gap_id] = PendingFill(
-            gap_id=gap_id,
-            chrom=chrom,
-            original_start=original_start,
-            original_end=original_end,
-            filled_start=filled_start,
-            filled_end=filled_end,
-            sequence=sequence,
-            is_complete=is_complete,
-            source=source,
-            tier=tier
-        )
-        self.set_status(gap_id, GapStatus.FILLED_PENDING,
-                       f"Filled with {source} (tier {tier}), awaiting validation")
-
-    def get_pending_fills(self) -> Dict[str, PendingFill]:
-        """Get all fills awaiting validation"""
-        return self._pending_fills.copy()
-
     def should_attempt(self, gap_id: str) -> bool:
         """Check if gap should be attempted in current iteration"""
         status = self.get_status(gap_id)
 
-        # Skip: already filled (pending or complete), unfillable
+        # Skip: already filled (complete or partial), unfillable
         if status in (GapStatus.UNFILLABLE, GapStatus.FILLED_COMPLETE,
-                      GapStatus.FILLED_PENDING):
+                      GapStatus.FILLED_PARTIAL):
             return False
 
         return True
@@ -925,37 +1065,28 @@ class GapStatusTracker:
 
     def to_dict(self) -> Dict:
         """Serialize to dictionary"""
-        pending_fills_dict = {}
-        for gap_id, pf in self._pending_fills.items():
-            pending_fills_dict[gap_id] = {
-                'chrom': pf.chrom,
-                'original_start': pf.original_start,
-                'original_end': pf.original_end,
-                'filled_start': pf.filled_start,
-                'filled_end': pf.filled_end,
-                'sequence': pf.sequence,
-                'is_complete': pf.is_complete,
-                'source': pf.source,
-                'tier': pf.tier
-            }
-
         return {
             'status': {k: v.value for k, v in self._status.items()},
             'history': dict(self._history),
-            'pending_fills': pending_fills_dict
         }
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'GapStatusTracker':
-        """Deserialize from dictionary"""
+        """Deserialize from dictionary, handling old format gracefully"""
         tracker = cls()
         for gap_id, status_str in data.get('status', {}).items():
-            tracker._status[gap_id] = GapStatus(status_str)
+            try:
+                status = GapStatus(status_str)
+            except ValueError:
+                status = GapStatus.FAILED
+            # Convert old FILLED_PENDING status to FAILED (needs re-fill)
+            if status == GapStatus.FILLED_PENDING:
+                tracker.logger.info(f"Converting {gap_id} from FILLED_PENDING to FAILED (old format)")
+                status = GapStatus.FAILED
+            tracker._status[gap_id] = status
         for gap_id, history in data.get('history', {}).items():
             tracker._history[gap_id] = history
-        for gap_id, pf_dict in data.get('pending_fills', {}).items():
-            tracker._pending_fills[gap_id] = PendingFill(
-                gap_id=gap_id,
-                **pf_dict
-            )
+        # Gracefully ignore old pending_fills data
+        if 'pending_fills' in data and data['pending_fills']:
+            tracker.logger.info(f"Ignoring {len(data['pending_fills'])} old pending_fills entries")
         return tracker

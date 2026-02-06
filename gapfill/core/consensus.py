@@ -32,9 +32,9 @@ class ConsensusBuilder:
 
     # Thresholds for consensus strategies
     MIN_READS_DIRECT = 3
-    MIN_READS_POA = 5
+    MIN_READS_POA = 3
     MIN_IDENTITY_DIRECT = 0.95
-    MIN_IDENTITY_POA = 0.90
+    MIN_IDENTITY_POA = 0.85
 
     def __init__(self, threads: int = 8):
         self.threads = threads
@@ -53,13 +53,15 @@ class ConsensusBuilder:
             return False
 
     def build_consensus(self, reads: List[Tuple[str, str, str]],
-                        gap_info: Optional[Dict] = None) -> Optional[Dict]:
+                        gap_info: Optional[Dict] = None,
+                        read_type: str = 'hifi') -> Optional[Dict]:
         """
         Attempt to build consensus from reads.
 
         Args:
             reads: List of (sequence, name, type) tuples
             gap_info: Optional gap information for size estimation
+            read_type: 'hifi' or 'ont' — affects strategy selection
 
         Returns:
             Dict with 'sequence', 'method', 'confidence' or None if failed
@@ -71,8 +73,23 @@ class ConsensusBuilder:
 
         # Calculate pairwise identity
         identity = self._estimate_identity(sequences)
-        self.logger.debug(f"  Consensus: {len(reads)} reads, identity={identity:.2%}")
+        self.logger.debug(f"  Consensus: {len(reads)} {read_type} reads, identity={identity:.2%}")
 
+        if read_type == 'ont':
+            # ONT reads: higher error rate, only use POA (no direct consensus)
+            if identity >= self.MIN_IDENTITY_POA and len(reads) >= 5:
+                consensus = self._poa_consensus(sequences)
+                if consensus:
+                    return {
+                        'sequence': consensus,
+                        'method': 'ont_poa_consensus',
+                        'confidence': identity,
+                        'read_count': len(reads),
+                        'identity': identity
+                    }
+            return None
+
+        # HiFi reads: use both strategies
         # Strategy 1: Direct consensus for highly consistent reads
         if identity >= self.MIN_IDENTITY_DIRECT and len(reads) >= self.MIN_READS_DIRECT:
             consensus = self._direct_consensus(sequences)
@@ -311,7 +328,8 @@ class ConsensusBuilder:
 
 def try_consensus_fill(reads: List[Tuple[str, str, str]],
                        gap_info: Dict,
-                       threads: int = 8) -> Optional[Dict]:
+                       threads: int = 8,
+                       read_type: str = 'hifi') -> Optional[Dict]:
     """
     Try to fill a gap using consensus-based approach.
 
@@ -321,12 +339,13 @@ def try_consensus_fill(reads: List[Tuple[str, str, str]],
         reads: List of (sequence, name, type) tuples
         gap_info: Gap information dict
         threads: Number of threads
+        read_type: 'hifi' or 'ont'
 
     Returns:
         Dict with fill result or None if consensus approach failed
     """
     builder = ConsensusBuilder(threads=threads)
-    result = builder.build_consensus(reads, gap_info)
+    result = builder.build_consensus(reads, gap_info, read_type=read_type)
 
     if result:
         return {

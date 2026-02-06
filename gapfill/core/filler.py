@@ -90,6 +90,61 @@ class GapFiller:
         self.logger.info(f"  Polish enabled: {self.enable_polish}")
         self.logger.info(f"  Validation enabled: {self.enable_validation}")
 
+    def _validate_fill_locally(self, result, gap, work_dir):
+        """
+        Validate a fill locally before accepting it.
+
+        Constructs a small local reference (flank + fill + flank), aligns nearby
+        reads to it, and checks spanning/coverage metrics.
+
+        Returns ValidationResult/PartialFillValidationResult, or None on error.
+        """
+        if not self.validator:
+            return None
+
+        is_complete = result.get('is_complete', False) and not result.get('has_placeholder', False)
+
+        return self.validator.validate_fill_locally(
+            hifi_bam=str(self.hifi_bam) if self.has_hifi else None,
+            ont_bam=str(self.ont_bam) if self.has_ont else None,
+            assembly_file=str(self.assembly_file),
+            chrom=gap['chrom'],
+            gap_start=gap['start'],
+            gap_end=gap['end'],
+            fill_sequence=result['sequence'],
+            is_complete=is_complete,
+            work_dir=str(work_dir / "local_validation"),
+            threads=min(2, self.threads)
+        )
+
+    @staticmethod
+    def _validation_to_dict(validation):
+        """Convert a validation result to a serializable dict."""
+        if validation is None:
+            return {'valid': True, 'status': 'not_validated', 'reason': 'validation skipped'}
+
+        from gapfill.core.validator import PartialFillValidationResult
+        if isinstance(validation, PartialFillValidationResult):
+            return {
+                'valid': validation.valid,
+                'status': validation.status.value,
+                'left_valid': validation.left_valid,
+                'right_valid': validation.right_valid,
+                'left_fill_length': validation.left_fill_length,
+                'right_fill_length': validation.right_fill_length,
+                'avg_coverage': validation.avg_coverage,
+                'reason': validation.reason,
+            }
+        else:
+            return {
+                'valid': validation.valid,
+                'status': validation.status.value,
+                'confidence': getattr(validation, 'confidence', 0.5),
+                'spanning_reads': getattr(validation, 'spanning_reads', 0),
+                'avg_coverage': getattr(validation, 'avg_coverage', 0),
+                'reason': getattr(validation, 'reason', ''),
+            }
+
     def fill_gap(self, gap: Dict) -> Dict:
         """Fill a single gap using tiered HiFi/ONT strategy"""
         chrom = gap['chrom']
@@ -113,16 +168,40 @@ class GapFiller:
         # =====================================================================
         # TIER 0: Direct Consensus (skip wtdbg2 for highly consistent reads)
         # =====================================================================
-        if self.enable_consensus_first and reads_info['hifi_spanning_count'] >= 5:
+        if self.enable_consensus_first and reads_info['hifi_spanning_count'] >= 3:
             self.logger.info(f"  TIER 0: Trying direct consensus...")
             consensus_result = try_consensus_fill(
                 reads_info['hifi_spanning'], gap, self.threads
             )
             if consensus_result:
                 consensus_result['tier'] = 0
-                self.logger.info(f"  ✓ TIER 0 success: {len(consensus_result['sequence'])}bp "
-                               f"({consensus_result['source']})")
-                return self._finalize_result(consensus_result, gap, reads_info)
+                validation = self._validate_fill_locally(consensus_result, gap, gap_work_dir)
+                if validation is None or validation.valid:
+                    consensus_result['validated'] = True
+                    consensus_result['validation'] = self._validation_to_dict(validation)
+                    self.logger.info(f"  ✓ TIER 0 success: {len(consensus_result['sequence'])}bp "
+                                   f"({consensus_result['source']})")
+                    return self._finalize_result(consensus_result, gap, reads_info)
+                else:
+                    self.logger.info(f"  TIER 0: validation failed: {validation.reason}, trying next...")
+
+        # ONT consensus attempt
+        if self.enable_consensus_first and reads_info['ont_spanning_count'] >= 5:
+            self.logger.info(f"  TIER 0b: Trying ONT consensus...")
+            consensus_result = try_consensus_fill(
+                reads_info['ont_spanning'], gap, self.threads, read_type='ont'
+            )
+            if consensus_result:
+                consensus_result['tier'] = 0
+                validation = self._validate_fill_locally(consensus_result, gap, gap_work_dir)
+                if validation is None or validation.valid:
+                    consensus_result['validated'] = True
+                    consensus_result['validation'] = self._validation_to_dict(validation)
+                    self.logger.info(f"  ✓ TIER 0b success: {len(consensus_result['sequence'])}bp "
+                                   f"({consensus_result['source']})")
+                    return self._finalize_result(consensus_result, gap, reads_info)
+                else:
+                    self.logger.info(f"  TIER 0b: validation failed: {validation.reason}, trying next...")
 
         # =====================================================================
         # TIER 1: HiFi-only Spanning (highest accuracy)
@@ -135,8 +214,14 @@ class GapFiller:
             if result['success']:
                 result['source'] = 'hifi_spanning'
                 result['tier'] = 1
-                self.logger.info(f"  ✓ TIER 1 success: {len(result['sequence'])}bp (HiFi-only)")
-                return self._finalize_result(result, gap, reads_info)
+                validation = self._validate_fill_locally(result, gap, gap_work_dir)
+                if validation is None or validation.valid:
+                    result['validated'] = True
+                    result['validation'] = self._validation_to_dict(validation)
+                    self.logger.info(f"  ✓ TIER 1 success: {len(result['sequence'])}bp (HiFi-only)")
+                    return self._finalize_result(result, gap, reads_info)
+                else:
+                    self.logger.info(f"  TIER 1: validation failed: {validation.reason}, trying next...")
 
         # =====================================================================
         # TIER 2: ONT-only Spanning (+ optional HiFi polish)
@@ -162,8 +247,14 @@ class GapFiller:
                 else:
                     result['source'] = 'ont_spanning'
                 result['tier'] = 2
-                self.logger.info(f"  ✓ TIER 2 success: {len(result['sequence'])}bp ({result['source']})")
-                return self._finalize_result(result, gap, reads_info)
+                validation = self._validate_fill_locally(result, gap, gap_work_dir)
+                if validation is None or validation.valid:
+                    result['validated'] = True
+                    result['validation'] = self._validation_to_dict(validation)
+                    self.logger.info(f"  ✓ TIER 2 success: {len(result['sequence'])}bp ({result['source']})")
+                    return self._finalize_result(result, gap, reads_info)
+                else:
+                    self.logger.info(f"  TIER 2: validation failed: {validation.reason}, trying next...")
 
         # =====================================================================
         # TIER 3: Hybrid Spanning (HiFi + ONT combined)
@@ -171,7 +262,6 @@ class GapFiller:
         total_spanning = reads_info['hifi_spanning_count'] + reads_info['ont_spanning_count']
         if total_spanning >= self.min_spanning_reads:
             self.logger.info(f"  TIER 3: Trying hybrid spanning...")
-            # Combine reads, but assemble separately and pick best
             result = self._assemble_hybrid_spanning(
                 reads_info['hifi_spanning'],
                 reads_info['ont_spanning'],
@@ -179,8 +269,14 @@ class GapFiller:
             )
             if result['success']:
                 result['tier'] = 3
-                self.logger.info(f"  ✓ TIER 3 success: {len(result['sequence'])}bp ({result['source']})")
-                return self._finalize_result(result, gap, reads_info)
+                validation = self._validate_fill_locally(result, gap, gap_work_dir)
+                if validation is None or validation.valid:
+                    result['validated'] = True
+                    result['validation'] = self._validation_to_dict(validation)
+                    self.logger.info(f"  ✓ TIER 3 success: {len(result['sequence'])}bp ({result['source']})")
+                    return self._finalize_result(result, gap, reads_info)
+                else:
+                    self.logger.info(f"  TIER 3: validation failed: {validation.reason}, trying next...")
 
         # =====================================================================
         # TIER 4: HiFi Flanking + Merge
@@ -193,8 +289,14 @@ class GapFiller:
             )
             if result['success']:
                 result['tier'] = 4
-                self.logger.info(f"  ✓ TIER 4 success: {len(result['sequence'])}bp ({result['source']})")
-                return self._finalize_result(result, gap, reads_info)
+                validation = self._validate_fill_locally(result, gap, gap_work_dir)
+                if validation is None or validation.valid:
+                    result['validated'] = True
+                    result['validation'] = self._validation_to_dict(validation)
+                    self.logger.info(f"  ✓ TIER 4 success: {len(result['sequence'])}bp ({result['source']})")
+                    return self._finalize_result(result, gap, reads_info)
+                else:
+                    self.logger.info(f"  TIER 4: validation failed: {validation.reason}, trying next...")
 
         # =====================================================================
         # TIER 5: ONT Flanking + Merge (+ optional HiFi polish)
@@ -217,8 +319,14 @@ class GapFiller:
                             result['sequence'] = polished
                             result['source'] = result['source'].replace('ont_', 'ont_hifi_polished_')
                 result['tier'] = 5
-                self.logger.info(f"  ✓ TIER 5 success: {len(result['sequence'])}bp ({result['source']})")
-                return self._finalize_result(result, gap, reads_info)
+                validation = self._validate_fill_locally(result, gap, gap_work_dir)
+                if validation is None or validation.valid:
+                    result['validated'] = True
+                    result['validation'] = self._validation_to_dict(validation)
+                    self.logger.info(f"  ✓ TIER 5 success: {len(result['sequence'])}bp ({result['source']})")
+                    return self._finalize_result(result, gap, reads_info)
+                else:
+                    self.logger.info(f"  TIER 5: validation failed: {validation.reason}, trying next...")
 
         # =====================================================================
         # TIER 6: Hybrid Flanking + 500N
@@ -233,8 +341,14 @@ class GapFiller:
             )
             if result['success']:
                 result['tier'] = 6
-                self.logger.info(f"  ✓ TIER 6 success: {len(result['sequence'])}bp ({result['source']})")
-                return self._finalize_result(result, gap, reads_info)
+                validation = self._validate_fill_locally(result, gap, gap_work_dir)
+                if validation is None or validation.valid:
+                    result['validated'] = True
+                    result['validation'] = self._validation_to_dict(validation)
+                    self.logger.info(f"  ✓ TIER 6 success: {len(result['sequence'])}bp ({result['source']})")
+                    return self._finalize_result(result, gap, reads_info)
+                else:
+                    self.logger.info(f"  TIER 6: validation failed: {validation.reason}, trying next...")
 
         # =====================================================================
         # All tiers failed - analyze flanks to determine if UNFILLABLE or NEEDS_POLISH
@@ -247,7 +361,7 @@ class GapFiller:
             'strategy': None,
             'source': None,
             'tier': None,
-            'reason': 'All tiers failed - no suitable reads found',
+            'reason': 'All tiers failed - no suitable reads or validation failed',
             'gap_name': gap_name,
             'reads_info': {
                 'hifi_spanning': reads_info['hifi_spanning_count'],
@@ -568,33 +682,167 @@ class GapFiller:
 
         return {'success': False, 'reason': 'Hybrid assembly failed'}
 
+    def _cluster_reads(self, reads: List[Tuple[str, str, str]],
+                        work_dir: Path, prefix: str,
+                        min_identity: float = 0.9) -> List[List[Tuple[str, str, str]]]:
+        """
+        Cluster reads by sequence similarity to separate reads from different sources.
+
+        This prevents mixing reads from different haplotypes/paralogs during assembly,
+        which can cause wtdbg2 to produce fragmented assemblies with internal Ns.
+
+        Args:
+            reads: List of (sequence, name, type) tuples
+            work_dir: Working directory
+            prefix: Prefix for temp files
+            min_identity: Minimum identity threshold for clustering (default 0.9)
+
+        Returns:
+            List of read clusters, each cluster is a list of reads
+        """
+        if len(reads) <= 3:
+            # Too few reads to cluster meaningfully
+            return [reads]
+
+        # Write reads to fasta
+        reads_fasta = work_dir / f"{prefix}_for_cluster.fasta"
+        with open(reads_fasta, 'w') as f:
+            for i, (seq, name, source) in enumerate(reads):
+                f.write(f">{i}\n{seq}\n")
+
+        # Use minimap2 all-vs-all alignment to compute similarity
+        try:
+            result = subprocess.run(
+                ['minimap2', '-x', 'ava-pb', '-t', str(min(4, self.threads)),
+                 str(reads_fasta), str(reads_fasta)],
+                capture_output=True, text=True, timeout=120
+            )
+
+            if result.returncode != 0:
+                return [reads]
+
+            # Parse PAF output to build similarity graph
+            # PAF format: qname qlen qstart qend strand tname tlen tstart tend matches alnlen mapq ...
+            similarities = defaultdict(dict)
+            for line in result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+                fields = line.split('\t')
+                if len(fields) < 11:
+                    continue
+
+                qname = int(fields[0])
+                tname = int(fields[5])
+                if qname == tname:
+                    continue
+
+                matches = int(fields[9])
+                alnlen = int(fields[10])
+                identity = matches / alnlen if alnlen > 0 else 0
+
+                # Store max identity between pairs
+                if tname not in similarities[qname] or identity > similarities[qname][tname]:
+                    similarities[qname][tname] = identity
+                    similarities[tname][qname] = identity
+
+            # Simple greedy clustering
+            n_reads = len(reads)
+            assigned = [False] * n_reads
+            clusters = []
+
+            for i in range(n_reads):
+                if assigned[i]:
+                    continue
+
+                # Start new cluster with read i
+                cluster_indices = [i]
+                assigned[i] = True
+
+                # Add all reads similar to any read in the cluster
+                changed = True
+                while changed:
+                    changed = False
+                    for j in range(n_reads):
+                        if assigned[j]:
+                            continue
+                        # Check if j is similar to any read in cluster
+                        for k in cluster_indices:
+                            if similarities[j].get(k, 0) >= min_identity:
+                                cluster_indices.append(j)
+                                assigned[j] = True
+                                changed = True
+                                break
+
+                clusters.append([reads[idx] for idx in cluster_indices])
+
+            # Sort clusters by size (largest first)
+            clusters.sort(key=len, reverse=True)
+
+            if len(clusters) > 1:
+                self.logger.info(f"    Clustered {len(reads)} reads into {len(clusters)} groups: "
+                               f"{[len(c) for c in clusters]}")
+
+            return clusters
+
+        except Exception as e:
+            self.logger.debug(f"Clustering failed: {e}")
+            return [reads]
+
     def _assemble_flanking_reads(self, left_reads: List[Tuple[str, str, str]],
                                   right_reads: List[Tuple[str, str, str]],
                                   work_dir: Path, read_type: str,
                                   gap_name: str, gap_info: Optional[Dict] = None) -> Dict:
         """Assemble flanking reads and try to merge"""
 
-        # Assemble left side
+        # Assemble left side - with clustering to avoid mixed-source assembly
         left_seq = ''
         if left_reads:
-            left_fasta = work_dir / f"left_{read_type}.fasta"
-            with open(left_fasta, 'w') as f:
-                for i, (seq, name, source) in enumerate(left_reads):
-                    f.write(f">{name}__{source}__{i}\n{seq}\n")
-            left_seq = self._run_wtdbg2_assembly(
-                left_fasta, work_dir, f"left_{read_type}", read_type, gap_info
-            ) or ''
+            # Cluster reads to separate different sources (haplotypes, paralogs)
+            left_clusters = self._cluster_reads(left_reads, work_dir, f"left_{read_type}")
 
-        # Assemble right side
+            # Try assembling each cluster, use the best (longest clean) result
+            best_left_seq = ''
+            for ci, cluster in enumerate(left_clusters):
+                if len(cluster) < 3:
+                    continue
+
+                left_fasta = work_dir / f"left_{read_type}_c{ci}.fasta"
+                with open(left_fasta, 'w') as f:
+                    for i, (seq, name, source) in enumerate(cluster):
+                        f.write(f">{name}__{source}__{i}\n{seq}\n")
+
+                assembled = self._run_wtdbg2_assembly(
+                    left_fasta, work_dir, f"left_{read_type}_c{ci}", read_type, gap_info
+                )
+
+                if assembled and len(assembled) > len(best_left_seq):
+                    best_left_seq = assembled
+
+            left_seq = best_left_seq
+
+        # Assemble right side - with clustering
         right_seq = ''
         if right_reads:
-            right_fasta = work_dir / f"right_{read_type}.fasta"
-            with open(right_fasta, 'w') as f:
-                for i, (seq, name, source) in enumerate(right_reads):
-                    f.write(f">{name}__{source}__{i}\n{seq}\n")
-            right_seq = self._run_wtdbg2_assembly(
-                right_fasta, work_dir, f"right_{read_type}", read_type, gap_info
-            ) or ''
+            right_clusters = self._cluster_reads(right_reads, work_dir, f"right_{read_type}")
+
+            best_right_seq = ''
+            for ci, cluster in enumerate(right_clusters):
+                if len(cluster) < 3:
+                    continue
+
+                right_fasta = work_dir / f"right_{read_type}_c{ci}.fasta"
+                with open(right_fasta, 'w') as f:
+                    for i, (seq, name, source) in enumerate(cluster):
+                        f.write(f">{name}__{source}__{i}\n{seq}\n")
+
+                assembled = self._run_wtdbg2_assembly(
+                    right_fasta, work_dir, f"right_{read_type}_c{ci}", read_type, gap_info
+                )
+
+                if assembled and len(assembled) > len(best_right_seq):
+                    best_right_seq = assembled
+
+            right_seq = best_right_seq
 
         if not left_seq and not right_seq:
             return {'success': False, 'reason': f'Flanking assembly failed for {read_type}'}
@@ -1046,7 +1294,20 @@ class GapFiller:
 
                 # Return longest sequence
                 best_seq = max(sequences, key=lambda x: len(x.seq))
-                return str(best_seq.seq)
+                raw_seq = str(best_seq.seq)
+
+                # Check for internal N-runs in wtdbg2 output
+                # If the assembly contains Ns even after clustering, the region is too complex
+                # Reject rather than insert potentially incorrect sequence
+                if 'N' in raw_seq.upper():
+                    import re
+                    n_count = len(re.findall(r'N+', raw_seq, re.IGNORECASE))
+                    n_total = raw_seq.upper().count('N')
+                    self.logger.info(f"    Assembly contains {n_count} N-runs ({n_total} Ns total), "
+                                   f"region too complex, skipping")
+                    return None
+
+                return raw_seq
 
             return None
 
@@ -1056,132 +1317,20 @@ class GapFiller:
 
     def _finalize_result(self, result: Dict, gap: Dict, reads_info: Dict) -> Dict:
         """
-        Finalize a successful fill result by adding validation info
+        Finalize a successful fill result.
 
-        For complete fills: validates coverage, spanning reads, junction quality
-        For partial fills: validates filled portions independently (left/right)
+        Since validation already happened during the tier loop (validate-before-apply),
+        this just adds reads info metadata.
         """
-        if not self.validator:
-            return result
+        if 'validation' not in result:
+            result['validation'] = {'valid': True, 'status': 'validated'}
 
-        chrom = gap['chrom']
-        gap_start = gap['start']
-        gap_end = gap['end']
-
-        # Determine BAM file to use for validation (prefer HiFi)
-        bam_file = None
-        if self.has_hifi:
-            bam_file = str(self.hifi_bam)
-        elif self.has_ont:
-            bam_file = str(self.ont_bam)
-
-        if not bam_file:
-            return result
-
-        try:
-            is_complete_fill = result.get('is_complete', False) and not result.get('has_placeholder', False)
-
-            if is_complete_fill:
-                # Complete fill - validate with full criteria (requires spanning reads)
-                validation = self.validator.validate_complete_fill(
-                    bam_file, chrom, gap_start, gap_end, result['sequence']
-                )
-
-                # Determine if this fill can skip delayed validation (high confidence)
-                # Criteria for skipping delayed validation:
-                # - Tier 0 or 1 (HiFi-based)
-                # - High spanning read count (>= 5)
-                # - Good coverage (>= 5x)
-                # - High validation confidence (>= 0.7)
-                tier = result.get('tier', 99)
-                total_spanning = (reads_info.get('hifi_spanning_count', 0) +
-                                reads_info.get('ont_spanning_count', 0))
-                skip_delayed_validation = (
-                    tier <= 1 and
-                    total_spanning >= 5 and
-                    validation.avg_coverage >= 5.0 and
-                    getattr(validation, 'confidence', 0) >= 0.7 and
-                    validation.valid
-                )
-
-                # Add validation info to result
-                result['validation'] = {
-                    'valid': validation.valid,
-                    'status': validation.status.value,
-                    'confidence': getattr(validation, 'confidence', 0.5),
-                    'spanning_reads': getattr(validation, 'spanning_reads', 0),
-                    'avg_coverage': validation.avg_coverage,
-                    'reason': validation.reason,
-                    'skip_delayed_validation': skip_delayed_validation
-                }
-
-                if skip_delayed_validation:
-                    self.logger.info(f"    ✓ High-confidence fill: skip delayed validation "
-                                   f"(tier={tier}, spanning={total_spanning}, "
-                                   f"cov={validation.avg_coverage:.1f}x)")
-                else:
-                    self.logger.debug(f"    Validation: {validation.status.value} "
-                                    f"(spanning={getattr(validation, 'spanning_reads', 0)}, "
-                                    f"cov={validation.avg_coverage:.1f}x)")
-
-            else:
-                # Partial fill with placeholder - validate independently for each side
-                seq = result['sequence']
-                import re
-                n_match = re.search(r'N{10,}', seq)
-
-                if n_match:
-                    new_gap_start = gap_start + n_match.start()
-                    new_gap_end = gap_start + n_match.end()
-
-                    validation = self.validator.validate_partial_fill(
-                        bam_file, chrom, gap_start, gap_end, seq,
-                        new_gap_start, new_gap_end
-                    )
-
-                    # Partial fills always go through delayed validation
-                    # because the validation is more complex (independent left/right)
-                    skip_delayed_validation = False
-
-                    # Handle PartialFillValidationResult
-                    if isinstance(validation, PartialFillValidationResult):
-                        result['validation'] = {
-                            'valid': validation.valid,
-                            'status': validation.status.value,
-                            'left_valid': validation.left_valid,
-                            'right_valid': validation.right_valid,
-                            'left_fill_length': validation.left_fill_length,
-                            'right_fill_length': validation.right_fill_length,
-                            'avg_coverage': validation.avg_coverage,
-                            'reason': validation.reason,
-                            'skip_delayed_validation': skip_delayed_validation
-                        }
-                        self.logger.debug(f"    Partial validation: {validation.reason}")
-                    else:
-                        # Fallback for ValidationResult
-                        result['validation'] = {
-                            'valid': validation.valid,
-                            'status': validation.status.value,
-                            'avg_coverage': validation.avg_coverage,
-                            'reason': validation.reason,
-                            'skip_delayed_validation': skip_delayed_validation
-                        }
-                else:
-                    # No N-run found but marked as partial - treat as complete
-                    validation = self.validator.validate_complete_fill(
-                        bam_file, chrom, gap_start, gap_end, result['sequence']
-                    )
-                    result['validation'] = {
-                        'valid': validation.valid,
-                        'status': validation.status.value,
-                        'avg_coverage': validation.avg_coverage,
-                        'reason': validation.reason,
-                        'skip_delayed_validation': False
-                    }
-
-        except Exception as e:
-            self.logger.warning(f"Validation error: {e}")
-            result['validation'] = {'valid': True, 'status': 'unknown', 'reason': str(e)}
+        result['reads_info'] = {
+            'hifi_spanning': reads_info.get('hifi_spanning_count', 0),
+            'ont_spanning': reads_info.get('ont_spanning_count', 0),
+            'hifi_flanking': reads_info.get('hifi_left_count', 0) + reads_info.get('hifi_right_count', 0),
+            'ont_flanking': reads_info.get('ont_left_count', 0) + reads_info.get('ont_right_count', 0),
+        }
 
         return result
 

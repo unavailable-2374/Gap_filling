@@ -1245,6 +1245,8 @@ class PolyploidEngine:
             output_dir=str(output_dir),
             threads=self.threads,
             max_iterations=self.max_iterations,
+            min_gap_size=self.min_gap_size,
+            min_mapq=self.min_mapq,
             skip_normalization=skip_normalization,
             optimized_mode=False,  # Already filtered at polyploid level
             parallel_filling=True,  # Parallel gap filling

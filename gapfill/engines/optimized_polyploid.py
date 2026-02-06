@@ -66,6 +66,7 @@ class OptimizedPolyploidEngine:
                  threads: int = 8,
                  max_iterations: int = 10,
                  min_gap_size: int = 100,
+                 min_mapq: int = 20,
                  use_ambiguous_reads: bool = True,
                  min_read_snps: int = 1,
                  resume: bool = False,
@@ -80,6 +81,7 @@ class OptimizedPolyploidEngine:
         self.threads = threads
         self.max_iterations = max_iterations
         self.min_gap_size = min_gap_size
+        self.min_mapq = min_mapq
         self.use_ambiguous_reads = use_ambiguous_reads
         self.min_read_snps = min_read_snps
         self.resume = resume
@@ -243,7 +245,7 @@ class OptimizedPolyploidEngine:
                     source_bam = preprocessing_dir / "hifi_full.bam"
                     self._align_reads(self.hifi_reads, ref_assembly, source_bam, 'map-hifi')
 
-                self.reads_cache.filter_bam(source_bam, 'hifi', min_mapq=20)
+                self.reads_cache.filter_bam(source_bam, 'hifi', min_mapq=self.min_mapq)
                 cache_summary = self.reads_cache.get_summary()
                 self.logger.info(f"  HiFi: kept {cache_summary['hifi']['stats']['kept']:,} / "
                                f"{cache_summary['hifi']['stats']['total']:,} reads "
@@ -269,7 +271,7 @@ class OptimizedPolyploidEngine:
                     source_bam = preprocessing_dir / "ont_full.bam"
                     self._align_reads(self.ont_reads, ref_assembly, source_bam, 'map-ont')
 
-                self.reads_cache.filter_bam(source_bam, 'ont', min_mapq=20)
+                self.reads_cache.filter_bam(source_bam, 'ont', min_mapq=self.min_mapq)
                 cache_summary = self.reads_cache.get_summary()
                 self.logger.info(f"  ONT: kept {cache_summary['ont']['stats']['kept']:,} / "
                                f"{cache_summary['ont']['stats']['total']:,} reads "
@@ -484,7 +486,8 @@ class OptimizedPolyploidEngine:
                     hifi_bam=str(hap_hifi_bam) if hap_hifi_bam else None,
                     ont_bam=str(hap_ont_bam) if hap_ont_bam else None,
                     threads=self.threads,
-                    work_dir=str(work_dir)
+                    work_dir=str(work_dir),
+                    min_mapq=self.min_mapq
                 )
 
                 # Fill gaps
@@ -493,7 +496,7 @@ class OptimizedPolyploidEngine:
                     result = filler.fill_gap(gap)
                     fill_results[gap['name']] = {'gap': gap, 'result': result}
 
-                    if result['success']:
+                    if result.get('success') and result.get('validated', False):
                         if result.get('is_complete') and not result.get('has_placeholder'):
                             filled_gaps[hap_name].add(gap['name'])
                             new_fills += 1
@@ -501,6 +504,16 @@ class OptimizedPolyploidEngine:
                             self.checkpoint.add_completed_gap_for_hap(
                                 hap_name, gap['name'], result.get('sequence', '')
                             )
+                        else:
+                            # Partial fill
+                            filled_gaps[hap_name].add(gap['name'])
+                            new_fills += 1
+                            self.checkpoint.add_completed_gap_for_hap(
+                                hap_name, gap['name'], result.get('sequence', '')
+                            )
+                    elif result.get('success'):
+                        # Assembled but validation failed
+                        self.checkpoint.add_failed_gap_for_hap(hap_name, gap['name'])
                     else:
                         self.checkpoint.add_failed_gap_for_hap(hap_name, gap['name'])
 
